@@ -2,8 +2,11 @@
 //!
 //! A light axum service that lives beside the relay. It does two things:
 //!
-//!   1. Receives flag events from the hub's abuse detector over `POST /ingest`, gated by a shared
-//!      secret header, and appends them to a durable, bounded, append-only log.
+//!   1. Receives flag events from the hub's abuse detector **over the CE mesh** (a directed
+//!      `send_message` on topic `ce-watch/flag`, authenticated by the libp2p sender NodeId) and
+//!      appends them to a durable, bounded, append-only log. There is NO HTTP and NO shared token
+//!      between the hub and ce-watch — see [`mesh`]. (The old `POST /ingest` + `x-ce-watch-token`
+//!      cheat is gone.)
 //!   2. Serves an admin-only single-page "security console" that renders the flag log as a
 //!      structured, filterable table with an unseen-count indicator.
 //!
@@ -11,12 +14,13 @@
 //! **ce-auth**: every admin request carries the operator's device-signed headers, which ce-watch
 //! forwards to ce-auth's `POST /verify`; it admits iff `{ok:true}`. Device enrollment, claim,
 //! request, approve and revoke all live in ce-auth (`auth.ce-net.com`). If ce-auth is unreachable,
-//! ce-watch fails CLOSED (503). `/ingest` keeps its own shared-secret header (server-to-server sink).
+//! ce-watch fails CLOSED (503).
 //!
 //! `GET /admin/challenge` proxies ce-auth's `GET /challenge?aud=ce-watch` verbatim so the console
 //! never needs to know ce-auth's address.
 
 mod auth;
+mod mesh;
 mod store;
 
 use std::net::SocketAddr;
@@ -33,14 +37,14 @@ use serde_json::json;
 use tower_http::cors::CorsLayer;
 
 use auth::{HttpVerifier, Verifier, VerifyError};
-use store::{FlagEvent, Store};
+use mesh::MeshIngest;
+use store::Store;
 
 const CONSOLE_HTML: &str = include_str!("console.html");
 
 #[derive(Clone)]
 struct AppState {
     store: Arc<Store>,
-    ingest_token: Arc<Option<String>>,
     /// Base URL of ce-auth (e.g. `http://127.0.0.1:8972`), used to proxy `/challenge` and to fetch
     /// the (lazily-built) [`Verifier`]'s endpoint. Slash-trimmed.
     ce_auth_url: Arc<String>,
@@ -63,19 +67,27 @@ async fn main() -> Result<()> {
     let data_dir = store::default_data_dir();
     let store = Arc::new(Store::open(data_dir.clone())?);
 
-    let ingest_token = env_token("CE_WATCH_INGEST_TOKEN");
-    if ingest_token.is_none() {
-        tracing::warn!("CE_WATCH_INGEST_TOKEN is unset — /ingest will reject all requests");
-    }
-
     let ce_auth_url = auth::ce_auth_url();
     tracing::info!(ce_auth_url = %ce_auth_url, "delegating admin device-auth to ce-auth");
 
     let verifier: Arc<dyn Verifier> = Arc::new(HttpVerifier::new(ce_auth_url.clone()));
 
+    // Flag ingest is a MESH receiver: attach to the co-located ce node and drain its app-message
+    // stream, admitting only flags from the hub's NodeId on topic `ce-watch/flag`. No HTTP, no token.
+    let node_url = mesh::ce_node_url();
+    let hub_node = mesh::hub_node();
+    if hub_node.is_empty() {
+        tracing::warn!(
+            "CE_WATCH_HUB_NODE is unset — every mesh flag will be rejected (no authorized hub)"
+        );
+    } else {
+        tracing::info!(hub_node = %hub_node, node_url = %node_url, "ce-watch mesh flag ingest armed");
+    }
+    let ingest = Arc::new(MeshIngest::new(store.clone(), hub_node));
+    tokio::spawn(mesh::run(node_url, ingest));
+
     let state = AppState {
         store,
-        ingest_token: Arc::new(ingest_token),
         ce_auth_url: Arc::new(ce_auth_url),
         verifier,
         http: reqwest::Client::new(),
@@ -102,32 +114,12 @@ fn router(state: AppState) -> Router {
         .route("/", get(serve_console))
         .route("/admin", get(serve_console))
         .route("/health", get(|| async { "ok" }))
-        .route("/ingest", post(ingest))
         .route("/admin/challenge", get(admin_challenge))
         .route("/admin/flags", get(admin_flags))
         .route("/admin/unseen", get(admin_unseen))
         .route("/admin/seen", post(admin_seen))
         .layer(CorsLayer::permissive())
         .with_state(state)
-}
-
-fn env_token(key: &str) -> Option<String> {
-    match std::env::var(key) {
-        Ok(v) if !v.is_empty() => Some(v),
-        _ => None,
-    }
-}
-
-/// Constant-ish header compare. Returns true only when a token is configured AND matches.
-fn header_matches(headers: &HeaderMap, name: &str, expected: &Option<String>) -> bool {
-    let expected = match expected {
-        Some(e) => e,
-        None => return false,
-    };
-    match headers.get(name).and_then(|v| v.to_str().ok()) {
-        Some(got) => got == expected.as_str(),
-        None => false,
-    }
 }
 
 /// `GET /admin/challenge` — proxy ce-auth's `GET /challenge?aud=ce-watch` verbatim. The console
@@ -214,27 +206,6 @@ async fn serve_console() -> impl IntoResponse {
     )
 }
 
-async fn ingest(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Json(event): Json<FlagEvent>,
-) -> impl IntoResponse {
-    if !header_matches(&headers, "x-ce-watch-token", &st.ingest_token) {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "bad token"}))).into_response();
-    }
-    match st.store.append(event) {
-        Ok(seq) => (StatusCode::OK, Json(json!({"ok": true, "seq": seq}))).into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "append failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "store"})),
-            )
-                .into_response()
-        }
-    }
-}
-
 #[derive(Deserialize)]
 struct FlagsQuery {
     since: Option<u64>,
@@ -298,6 +269,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use std::sync::Mutex;
+    use store::FlagEvent;
     use tower::ServiceExt; // oneshot
 
     fn temp_dir() -> std::path::PathBuf {
@@ -352,7 +324,6 @@ mod tests {
     fn state_with(dir: std::path::PathBuf, outcome: MockOutcome) -> AppState {
         AppState {
             store: Arc::new(Store::open(dir).expect("open store")),
-            ingest_token: Arc::new(Some("ingest-secret".to_string())),
             ce_auth_url: Arc::new("http://127.0.0.1:0".to_string()),
             verifier: Arc::new(MockVerifier::new(outcome)),
             http: reqwest::Client::new(),
@@ -396,49 +367,6 @@ mod tests {
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
-    }
-
-    #[tokio::test]
-    async fn ingest_rejects_bad_token() {
-        let dir = temp_dir();
-        let app = router(state_with(dir.clone(), MockOutcome::Deny));
-        let req = Request::builder()
-            .method("POST")
-            .uri("/ingest")
-            .header("content-type", "application/json")
-            .header("x-ce-watch-token", "WRONG")
-            .body(Body::from(sample_flag().to_string()))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn ingest_accepts_good_token_and_stores() {
-        let dir = temp_dir();
-        let st = state_with(dir.clone(), MockOutcome::Deny);
-        let app = router(st.clone());
-        let req = Request::builder()
-            .method("POST")
-            .uri("/ingest")
-            .header("content-type", "application/json")
-            .header("x-ce-watch-token", "ingest-secret")
-            .body(Body::from(sample_flag().to_string()))
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        assert_eq!(st.store.head_seq(), 1);
-        assert_eq!(st.store.unseen(), 1);
-        let flags = st.store.query(None, None, None, None, 10);
-        assert_eq!(flags.len(), 1);
-        assert_eq!(flags[0].event.heuristic, "H2");
-
-        let log = dir.join("flags.jsonl");
-        let contents = std::fs::read_to_string(&log).unwrap();
-        assert!(contents.contains("count_primes"));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- relying-party admin auth (delegates to ce-auth /verify) ----
@@ -508,7 +436,6 @@ mod tests {
         }));
         let st = AppState {
             store: Arc::new(Store::open(dir.clone()).expect("open store")),
-            ingest_token: Arc::new(Some("ingest-secret".to_string())),
             ce_auth_url: Arc::new("http://127.0.0.1:0".to_string()),
             verifier: mock.clone(),
             http: reqwest::Client::new(),

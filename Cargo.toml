@@ -18,9 +18,15 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+# ce-rs SDK: drives the co-located ce node over http://127.0.0.1:8844 to drain the mesh
+# app-message stream (messages_stream). Flag ingest is now a real mesh hop authenticated by the
+# libp2p sender NodeId — no HTTP, no shared token between the hub and ce-watch.
+ce-rs = { path = "../ce-rs" }
+futures-util = "0.3"
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }
+hex = "0.4"
 
 [profile.release]
 opt-level = 2
