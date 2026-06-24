@@ -4,16 +4,17 @@
 //!
 //!   1. Receives flag events from the hub's abuse detector over `POST /ingest`, gated by a shared
 //!      secret header, and appends them to a durable, bounded, append-only log.
-//!   2. Serves an admin-only single-page "security console" (gated by a separate admin token) that
-//!      renders the flag log as a structured, filterable table with an unseen-count indicator.
+//!   2. Serves an admin-only single-page "security console" that renders the flag log as a
+//!      structured, filterable table with an unseen-count indicator.
 //!
-//! It deliberately holds NO libp2p / wasmtime / heavy deps — it is purely an HTTP sink + dashboard.
-//! The node and hub stay the source of truth for the mesh; ce-watch is the operator's read model.
+//! ce-watch holds NO device registry and NO in-process crypto. It is a thin **relying party** of
+//! **ce-auth**: every admin request carries the operator's device-signed headers, which ce-watch
+//! forwards to ce-auth's `POST /verify`; it admits iff `{ok:true}`. Device enrollment, claim,
+//! request, approve and revoke all live in ce-auth (`auth.ce-net.com`). If ce-auth is unreachable,
+//! ce-watch fails CLOSED (503). `/ingest` keeps its own shared-secret header (server-to-server sink).
 //!
-//! Admin auth is the ce-secrets challenge-response primitive (see `auth`): the operator enrolls
-//! their device's public key ONCE at deploy via `CE_WATCH_ADMIN_DEVICES`, then every request proves
-//! possession of the matching private key over a fresh signed challenge. There is no pasted bearer
-//! token. `/ingest` keeps its own shared-secret header (it is a server-to-server sink).
+//! `GET /admin/challenge` proxies ce-auth's `GET /challenge?aud=ce-watch` verbatim so the console
+//! never needs to know ce-auth's address.
 
 mod auth;
 mod store;
@@ -31,7 +32,8 @@ use serde::Deserialize;
 use serde_json::json;
 use tower_http::cors::CorsLayer;
 
-use store::{AdminStore, FlagEvent, RevokeOutcome, Store};
+use auth::{HttpVerifier, Verifier, VerifyError};
+use store::{FlagEvent, Store};
 
 const CONSOLE_HTML: &str = include_str!("console.html");
 
@@ -39,13 +41,14 @@ const CONSOLE_HTML: &str = include_str!("console.html");
 struct AppState {
     store: Arc<Store>,
     ingest_token: Arc<Option<String>>,
-    /// Self-managed admin device store (deviceId -> { pub, role, label, added_ts }), persisted to
-    /// `admins.json`. The source of truth for who is an admin after boot. Env-seeded at startup.
-    admins: Arc<AdminStore>,
-    /// Stateless-nonce HMAC key. Persisted across a process restart only if `CE_WATCH_SERVER_SECRET`
-    /// is set; otherwise a fresh random secret is minted per boot (in-flight challenges from before a
-    /// restart simply expire, which is the safe default).
-    server_secret: Arc<Vec<u8>>,
+    /// Base URL of ce-auth (e.g. `http://127.0.0.1:8972`), used to proxy `/challenge` and to fetch
+    /// the (lazily-built) [`Verifier`]'s endpoint. Slash-trimmed.
+    ce_auth_url: Arc<String>,
+    /// The relying-party verifier: forwards device-signed headers to ce-auth's `/verify`. Injectable
+    /// so tests can supply a mock instead of a live ce-auth.
+    verifier: Arc<dyn Verifier>,
+    /// HTTP client used to proxy `GET /admin/challenge` -> ce-auth `GET /challenge?aud=ce-watch`.
+    http: reqwest::Client,
 }
 
 #[tokio::main]
@@ -61,30 +64,21 @@ async fn main() -> Result<()> {
     let store = Arc::new(Store::open(data_dir.clone())?);
 
     let ingest_token = env_token("CE_WATCH_INGEST_TOKEN");
-    // The env is now a BOOTSTRAP seed, not the source of truth: it is written into the persisted
-    // admin store at startup for any device not already present, after which admins are managed
-    // self-service (claim / request / approve / revoke) without ever touching the env or redeploying.
-    let seed = auth::parse_seed(&std::env::var("CE_WATCH_ADMIN_DEVICES").unwrap_or_default());
-    let admins = Arc::new(AdminStore::open(&data_dir, &seed)?);
-    let server_secret = server_secret_from_env();
-
     if ingest_token.is_none() {
         tracing::warn!("CE_WATCH_INGEST_TOKEN is unset — /ingest will reject all requests");
     }
-    if !admins.has_admins() {
-        tracing::warn!(
-            "no admin device yet — open the console and click \"Claim this console\" to become the \
-             first admin (TOFU). Or seed one via CE_WATCH_ADMIN_DEVICES (deviceId:ecdsaPubB64url)."
-        );
-    } else {
-        tracing::info!(count = admins.admin_count(), "admin device(s) present");
-    }
+
+    let ce_auth_url = auth::ce_auth_url();
+    tracing::info!(ce_auth_url = %ce_auth_url, "delegating admin device-auth to ce-auth");
+
+    let verifier: Arc<dyn Verifier> = Arc::new(HttpVerifier::new(ce_auth_url.clone()));
 
     let state = AppState {
         store,
         ingest_token: Arc::new(ingest_token),
-        admins,
-        server_secret: Arc::new(server_secret),
+        ce_auth_url: Arc::new(ce_auth_url),
+        verifier,
+        http: reqwest::Client::new(),
     };
 
     let app = router(state);
@@ -110,12 +104,6 @@ fn router(state: AppState) -> Router {
         .route("/health", get(|| async { "ok" }))
         .route("/ingest", post(ingest))
         .route("/admin/challenge", get(admin_challenge))
-        .route("/admin/me", get(admin_me))
-        .route("/admin/claim", post(admin_claim))
-        .route("/admin/request", post(admin_request))
-        .route("/admin/devices", get(admin_devices))
-        .route("/admin/devices/approve", post(admin_devices_approve))
-        .route("/admin/devices/revoke", post(admin_devices_revoke))
         .route("/admin/flags", get(admin_flags))
         .route("/admin/unseen", get(admin_unseen))
         .route("/admin/seen", post(admin_seen))
@@ -142,267 +130,81 @@ fn header_matches(headers: &HeaderMap, name: &str, expected: &Option<String>) ->
     }
 }
 
-/// Resolve the stateless-nonce HMAC key: from `CE_WATCH_SERVER_SECRET` if set (so challenges survive
-/// a restart), otherwise a fresh 32-byte random secret minted per boot.
-fn server_secret_from_env() -> Vec<u8> {
-    if let Ok(s) = std::env::var("CE_WATCH_SERVER_SECRET") {
-        if !s.is_empty() {
-            return s.into_bytes();
+/// `GET /admin/challenge` — proxy ce-auth's `GET /challenge?aud=ce-watch` verbatim. The console
+/// signs the returned `{ aud, nonce, ts }` with its device key; only a device enrolled in ce-auth
+/// can produce a signature that ce-auth will later accept, so handing out challenges is harmless.
+/// If ce-auth is unreachable we fail closed (503).
+async fn admin_challenge(State(st): State<AppState>) -> impl IntoResponse {
+    let url = format!("{}/challenge?aud={}", st.ce_auth_url, auth::AUD);
+    match st.http.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+            Ok(body) => (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response(),
+            Err(e) => {
+                tracing::warn!(error = %e, "reading ce-auth /challenge body failed");
+                ce_auth_down()
+            }
+        },
+        Ok(resp) => {
+            tracing::warn!(status = %resp.status(), "ce-auth /challenge returned non-2xx");
+            ce_auth_down()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "ce-auth /challenge unreachable");
+            ce_auth_down()
         }
     }
-    // Cheap, dependency-free CSPRNG-ish seed: mix time + addr entropy. The nonce is only a replay
-    // guard within a 300s window, not a long-term key, so a per-boot ephemeral secret is sufficient.
-    let mut seed = Vec::with_capacity(32);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    seed.extend_from_slice(&nanos.to_le_bytes());
-    seed.extend_from_slice(&std::process::id().to_le_bytes());
-    let h = &seed as *const _ as usize;
-    seed.extend_from_slice(&h.to_le_bytes());
-    // Stretch to 32 bytes via SHA-256 (ce-secrets-rs already pulls sha2 transitively, but to avoid a
-    // new direct dep we just repeat-and-truncate the entropy; it remains unguessable for replay).
-    while seed.len() < 32 {
-        seed.push(seed[seed.len() % seed.len().max(1)].wrapping_add(0x9e));
-    }
-    seed.truncate(32);
-    seed
 }
 
-/// `GET /admin/challenge` — mint a fresh `{ aud, nonce, ts }` for the console to sign. Public: the
-/// nonce is single-use within 300s and only the holder of an enrolled device key can produce a
-/// signature that subsequently verifies, so handing out challenges is harmless.
-async fn admin_challenge(State(st): State<AppState>) -> impl IntoResponse {
-    let ch = auth::make_challenge(&st.server_secret);
-    (
-        StatusCode::OK,
-        Json(json!({ "aud": ch.aud, "nonce": ch.nonce, "ts": ch.ts })),
-    )
-        .into_response()
-}
-
-/// The 401 returned whenever admin device-auth fails, for any reason. We deliberately do not leak
-/// which check failed to the client.
+/// The 401 returned whenever admin device-auth is denied by ce-auth (bad sig, expired nonce, not an
+/// admin) or when the device-signed headers are absent. We do not leak which check failed.
 fn unauthorized() -> axum::response::Response {
     (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response()
 }
 
-/// Prove the request controls the device key for the claimed `deviceId` ("key-valid"). The verifying
-/// key is resolved from the persisted admin store if the device is known; otherwise (a first-time
-/// device) the caller must supply it via the `body_pub` argument (TOFU for claim/request). Returns
-/// the authenticated device id on success, or the ready-to-return 401.
-fn require_key_valid(
-    st: &AppState,
-    headers: &HeaderMap,
-    body_pub: Option<&str>,
-) -> Result<String, axum::response::Response> {
-    // Prefer the persisted pub for a known device; fall back to the body-supplied pub for an
-    // unknown one. We must not let a known device be authenticated against an attacker-chosen body
-    // pub, so the stored pub always wins when present.
-    let device_id = match auth::header_device_id(headers) {
-        Some(id) => id,
-        None => return Err(unauthorized()),
-    };
-    let pub_b64 = match st.admins.pub_of(device_id).or_else(|| body_pub.map(|s| s.to_string())) {
-        Some(p) => p,
-        None => return Err(unauthorized()),
-    };
-    match auth::authenticate_with_pub(headers, &pub_b64, &st.server_secret) {
-        Ok(id) => Ok(id.to_string()),
-        Err(e) => {
-            tracing::debug!(reason = ?e, "device key-valid auth rejected");
-            Err(unauthorized())
-        }
-    }
-}
-
-/// Require the request be both key-valid AND carry `role=admin` in the store. Used by the flag
-/// endpoints and the device-management endpoints. Returns the authenticated admin device id.
-fn require_admin(st: &AppState, headers: &HeaderMap) -> Result<String, axum::response::Response> {
-    let device_id = require_key_valid(st, headers, None)?;
-    if st.admins.is_admin(&device_id) {
-        Ok(device_id)
-    } else {
-        tracing::debug!(device_id = %device_id, "key-valid but not admin");
-        Err(unauthorized())
-    }
-}
-
-/// `GET /admin/me` — key-valid required. Reports this device's role from the store and whether any
-/// admin exists yet, so the console can pick the right screen (console / claim / request).
-async fn admin_me(State(st): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let device_id = match require_key_valid(&st, &headers, None) {
-        Ok(id) => id,
-        Err(resp) => return resp,
-    };
-    let role = st.admins.role_of(&device_id);
+/// The 503 returned whenever ce-auth cannot be reached. Fail-closed: an auth outage NEVER admits.
+fn ce_auth_down() -> axum::response::Response {
     (
-        StatusCode::OK,
-        Json(json!({
-            "deviceId": device_id,
-            "role": role,
-            "hasAdmins": st.admins.has_admins(),
-        })),
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": "auth service unavailable"})),
     )
         .into_response()
 }
 
-#[derive(Deserialize)]
-struct ClaimBody {
-    #[serde(default, rename = "pub")]
-    pub_b64: String,
-}
-
-/// `POST /admin/claim` — TOFU first-claim. If the store has ZERO admins, the (key-valid) requesting
-/// device becomes `role=admin`. If any admin already exists -> 409. The body carries the device's
-/// compact pub so we can both key-verify and persist it.
-async fn admin_claim(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<ClaimBody>,
-) -> impl IntoResponse {
-    if body.pub_b64.is_empty() || auth::validate_compact_pub(&body.pub_b64).is_err() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad pub"}))).into_response();
-    }
-    let device_id = match require_key_valid(&st, &headers, Some(&body.pub_b64)) {
-        Ok(id) => id,
-        Err(resp) => return resp,
-    };
-    match st.admins.claim(&device_id, &body.pub_b64) {
-        Ok(true) => (
-            StatusCode::OK,
-            Json(json!({"ok": true, "deviceId": device_id, "role": "admin"})),
-        )
-            .into_response(),
-        Ok(false) => (
-            StatusCode::CONFLICT,
-            Json(json!({"error": "admins already exist; ask one to approve your request"})),
-        )
-            .into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "claim persist failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "store"}))).into_response()
+/// Gate an admin request through ce-auth, running the (blocking) verify off the async executor.
+/// Returns the authenticated admin device id, or the ready response: 401 on missing headers /
+/// denied, 503 on ce-auth unreachable (fail-closed — an auth outage NEVER admits).
+async fn require_admin_async(
+    st: &AppState,
+    headers: &HeaderMap,
+) -> Result<String, axum::response::Response> {
+    let verifier = st.verifier.clone();
+    let headers = headers.clone();
+    let res = tokio::task::spawn_blocking(move || auth::require_admin(verifier.as_ref(), &headers))
+        .await
+        .unwrap_or_else(|_| Err(VerifyError::Unreachable("verify task panicked".into())));
+    match res {
+        Ok(id) => Ok(id),
+        Err(VerifyError::MissingHeaders) => Err(unauthorized()),
+        Err(VerifyError::Denied(v)) => {
+            tracing::debug!(role = %v.role, device_id = %v.device_id, "ce-auth denied admin");
+            Err(unauthorized())
         }
-    }
-}
-
-#[derive(Deserialize)]
-struct RequestBody {
-    #[serde(default)]
-    label: String,
-    #[serde(default, rename = "pub")]
-    pub_b64: String,
-}
-
-/// `POST /admin/request` — key-valid required. Records the device as `role=pending` with its compact
-/// pub (so an admin can later approve+verify it) and an optional label. Idempotent.
-async fn admin_request(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<RequestBody>,
-) -> impl IntoResponse {
-    if body.pub_b64.is_empty() || auth::validate_compact_pub(&body.pub_b64).is_err() {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad pub"}))).into_response();
-    }
-    let device_id = match require_key_valid(&st, &headers, Some(&body.pub_b64)) {
-        Ok(id) => id,
-        Err(resp) => return resp,
-    };
-    match st.admins.request(&device_id, &body.pub_b64, body.label.trim()) {
-        Ok(role) => (
-            StatusCode::OK,
-            Json(json!({"ok": true, "deviceId": device_id, "role": role})),
-        )
-            .into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "request persist failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "store"}))).into_response()
-        }
-    }
-}
-
-/// `GET /admin/devices` — ADMIN ONLY. Lists admins and pending devices.
-async fn admin_devices(State(st): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(resp) = require_admin(&st, &headers) {
-        return resp;
-    }
-    let mut admins = Vec::new();
-    let mut pending = Vec::new();
-    for (id, dev) in st.admins.list() {
-        let row = json!({ "deviceId": id, "label": dev.label, "added_ts": dev.added_ts });
-        if dev.role == store::ROLE_ADMIN {
-            admins.push(row);
-        } else {
-            pending.push(row);
-        }
-    }
-    (StatusCode::OK, Json(json!({ "admins": admins, "pending": pending }))).into_response()
-}
-
-#[derive(Deserialize)]
-struct DeviceIdBody {
-    #[serde(rename = "deviceId")]
-    device_id: String,
-}
-
-/// `POST /admin/devices/approve` — ADMIN ONLY. Promote a pending device to admin.
-async fn admin_devices_approve(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<DeviceIdBody>,
-) -> impl IntoResponse {
-    if let Err(resp) = require_admin(&st, &headers) {
-        return resp;
-    }
-    match st.admins.approve(&body.device_id) {
-        Ok(true) => (StatusCode::OK, Json(json!({"ok": true, "role": "admin"}))).into_response(),
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "no pending device with that id"})),
-        )
-            .into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "approve persist failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "store"}))).into_response()
-        }
-    }
-}
-
-/// `POST /admin/devices/revoke` — ADMIN ONLY. Remove a device. Cannot remove the last admin.
-async fn admin_devices_revoke(
-    State(st): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<DeviceIdBody>,
-) -> impl IntoResponse {
-    if let Err(resp) = require_admin(&st, &headers) {
-        return resp;
-    }
-    match st.admins.revoke(&body.device_id) {
-        Ok(RevokeOutcome::Removed) => {
-            (StatusCode::OK, Json(json!({"ok": true}))).into_response()
-        }
-        Ok(RevokeOutcome::NotFound) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "no device with that id"})),
-        )
-            .into_response(),
-        Ok(RevokeOutcome::LastAdmin) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "cannot revoke the last admin"})),
-        )
-            .into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "revoke persist failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "store"}))).into_response()
+        Err(VerifyError::Unreachable(reason)) => {
+            tracing::warn!(reason = %reason, "ce-auth unreachable — failing closed (503)");
+            Err(ce_auth_down())
         }
     }
 }
 
 async fn serve_console() -> impl IntoResponse {
-    // The HTML itself is public; the data behind it is gated by ce-secrets device-auth. The page
-    // holds a device key in localStorage, fetches /admin/challenge, signs it, and sends the
-    // x-ce-device-id / x-ce-auth / x-ce-aud / x-ce-nonce / x-ce-ts headers on every data call.
+    // The HTML is public; the data behind it is gated by ce-auth device-auth. The page holds a
+    // device key in localStorage, fetches /admin/challenge (proxied to ce-auth), signs it, and sends
+    // the x-ce-device-id / x-ce-auth / x-ce-aud / x-ce-nonce / x-ce-ts headers on every data call.
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
@@ -447,7 +249,7 @@ async fn admin_flags(
     headers: HeaderMap,
     Query(q): Query<FlagsQuery>,
 ) -> impl IntoResponse {
-    if let Err(resp) = require_admin(&st, &headers) {
+    if let Err(resp) = require_admin_async(&st, &headers).await {
         return resp;
     }
     let limit = q.limit.unwrap_or(1000).min(5000);
@@ -470,14 +272,14 @@ async fn admin_flags(
 }
 
 async fn admin_unseen(State(st): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(resp) = require_admin(&st, &headers) {
+    if let Err(resp) = require_admin_async(&st, &headers).await {
         return resp;
     }
     (StatusCode::OK, Json(json!({"unseen": st.store.unseen(), "head": st.store.head_seq()}))).into_response()
 }
 
 async fn admin_seen(State(st): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(resp) = require_admin(&st, &headers) {
+    if let Err(resp) = require_admin_async(&st, &headers).await {
         return resp;
     }
     st.store.mark_seen();
@@ -492,8 +294,10 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use auth::{SignedHeaders, VerifyResponse};
     use axum::body::Body;
     use axum::http::Request;
+    use std::sync::Mutex;
     use tower::ServiceExt; // oneshot
 
     fn temp_dir() -> std::path::PathBuf {
@@ -506,90 +310,71 @@ mod tests {
         d
     }
 
-    use ce_secrets_rs::{sign_challenge, DeviceKey};
-
-    const SERVER_SECRET: &[u8] = b"test-server-secret";
-
-    /// The operator's device key, enrolled into the test state. Real P-256 ECDH+ECDSA pair.
-    fn test_device() -> DeviceKey {
-        let dk_json = r#"{
-          "ecdhPriv":{"key_ops":["deriveBits"],"ext":true,"kty":"EC","x":"M3CtY4emfBsOGSCycOGY_wRD2ufV_Glmwt95AQRJRKo","y":"Q2p7o-FMQ-wRaiTOXzMd6Dyj3aFQQsi4v71k1sNnArs","crv":"P-256","d":"sR3IYJSDqB8x4l3J3p6w8t3y2QZ1m0c9V7n4kL2bA8E"},
-          "ecdhPub":{"key_ops":[],"ext":true,"kty":"EC","x":"M3CtY4emfBsOGSCycOGY_wRD2ufV_Glmwt95AQRJRKo","y":"Q2p7o-FMQ-wRaiTOXzMd6Dyj3aFQQsi4v71k1sNnArs","crv":"P-256"},
-          "ecdsaPriv":{"key_ops":["sign"],"ext":true,"kty":"EC","x":"ReIzIU_aBWgw2kRAa42L_AZiQmiYYb4RsvdGTwdR-jk","y":"oPRQppQEcMfMJknsjaQNU2uZc4Hz7GZ9T_Bf0J2L4KM","crv":"P-256","d":"pQ7w2zX9c4V6n8m1L3k5J7h9G2f4D6s8A0b2C4e6F8I"},
-          "ecdsaPub":{"key_ops":["verify"],"ext":true,"kty":"EC","x":"ReIzIU_aBWgw2kRAa42L_AZiQmiYYb4RsvdGTwdR-jk","y":"oPRQppQEcMfMJknsjaQNU2uZc4Hz7GZ9T_Bf0J2L4KM","crv":"P-256"},
-          "id":"0e30d71a203f8933"
-        }"#;
-        DeviceKey::from_json(dk_json).unwrap()
+    /// A mock [`Verifier`] standing in for ce-auth's `/verify`. Configured to admit, deny, or be
+    /// unreachable, and records the headers it was asked to verify so tests can assert the forward.
+    struct MockVerifier {
+        outcome: MockOutcome,
+        seen: Mutex<Option<SignedHeaders>>,
     }
-
-    /// A SECOND, distinct real P-256 device key (different ecdsa keypair + id) used to exercise the
-    /// request/approve/revoke flow against the seeded admin. The ecdh half mirrors the ecdsa pub
-    /// (irrelevant to signing); the id is fixed and distinct from `test_device()`.
-    fn second_device() -> DeviceKey {
-        let dk_json = r#"{
-          "ecdhPriv":{"key_ops":["deriveBits"],"ext":true,"kty":"EC","x":"Xmkz8xdxZN39CEu4t437RTP9zqSpeN_HEPWFl-Wcvic","y":"WHvWLOzDWyZmUhG8nnISc8dN5Gol-Cyfm1YaJpIvUWU","crv":"P-256","d":"ok8M6GVgJIfF71fjBubSB3L_0HvfvcQeunr9N-5IFnA"},
-          "ecdhPub":{"key_ops":[],"ext":true,"kty":"EC","x":"Xmkz8xdxZN39CEu4t437RTP9zqSpeN_HEPWFl-Wcvic","y":"WHvWLOzDWyZmUhG8nnISc8dN5Gol-Cyfm1YaJpIvUWU","crv":"P-256"},
-          "ecdsaPriv":{"key_ops":["sign"],"ext":true,"kty":"EC","x":"Xmkz8xdxZN39CEu4t437RTP9zqSpeN_HEPWFl-Wcvic","y":"WHvWLOzDWyZmUhG8nnISc8dN5Gol-Cyfm1YaJpIvUWU","crv":"P-256","d":"ok8M6GVgJIfF71fjBubSB3L_0HvfvcQeunr9N-5IFnA"},
-          "ecdsaPub":{"key_ops":["verify"],"ext":true,"kty":"EC","x":"Xmkz8xdxZN39CEu4t437RTP9zqSpeN_HEPWFl-Wcvic","y":"WHvWLOzDWyZmUhG8nnISc8dN5Gol-Cyfm1YaJpIvUWU","crv":"P-256"},
-          "id":"f00dcafe12345678"
-        }"#;
-        DeviceKey::from_json(dk_json).unwrap()
+    #[derive(Clone)]
+    enum MockOutcome {
+        /// `{ok:true}` — admit, with this device id / role echoed back.
+        Ok { device_id: String, role: String },
+        /// `{ok:false}` — ce-auth denied.
+        Deny,
+        /// ce-auth could not be reached.
+        Down,
     }
-
-    /// The compact ECDSA SEC1 pub for a device — the exact string the console derives and persists.
-    fn compact_pub(dk: &DeviceKey) -> String {
-        ce_secrets_rs::encoding::b64url_encode(&dk.ecdsa_pub.raw_public_bytes().unwrap())
+    impl MockVerifier {
+        fn new(outcome: MockOutcome) -> Self {
+            Self { outcome, seen: Mutex::new(None) }
+        }
     }
-
-    /// State with the test device SEEDED as an admin (mirrors `CE_WATCH_ADMIN_DEVICES`) and a fixed
-    /// server secret (so challenges are reproducible across handler calls within a test).
-    fn state_with(dir: std::path::PathBuf) -> AppState {
-        let dk = test_device();
-        let seed = vec![(dk.id.clone(), compact_pub(&dk))];
-        let admins = Arc::new(AdminStore::open(&dir, &seed).expect("open admin store"));
-        AppState {
-            store: Arc::new(Store::open(dir).expect("open store")),
-            ingest_token: Arc::new(Some("ingest-secret".to_string())),
-            admins,
-            server_secret: Arc::new(SERVER_SECRET.to_vec()),
+    impl Verifier for MockVerifier {
+        fn verify(&self, headers: &SignedHeaders) -> Result<VerifyResponse, VerifyError> {
+            *self.seen.lock().unwrap() = Some(headers.clone());
+            match &self.outcome {
+                MockOutcome::Ok { device_id, role } => Ok(VerifyResponse {
+                    ok: true,
+                    role: role.clone(),
+                    device_id: device_id.clone(),
+                }),
+                MockOutcome::Deny => Err(VerifyError::Denied(VerifyResponse {
+                    ok: false,
+                    role: "none".into(),
+                    device_id: String::new(),
+                })),
+                MockOutcome::Down => Err(VerifyError::Unreachable("mock down".into())),
+            }
         }
     }
 
-    /// State with NO admins seeded — empty store (used to test claim/request/unauthorized paths).
-    fn state_empty(dir: std::path::PathBuf) -> AppState {
-        let admins = Arc::new(AdminStore::open(&dir, &[]).expect("open admin store"));
+    fn state_with(dir: std::path::PathBuf, outcome: MockOutcome) -> AppState {
         AppState {
             store: Arc::new(Store::open(dir).expect("open store")),
             ingest_token: Arc::new(Some("ingest-secret".to_string())),
-            admins,
-            server_secret: Arc::new(SERVER_SECRET.to_vec()),
+            ce_auth_url: Arc::new("http://127.0.0.1:0".to_string()),
+            verifier: Arc::new(MockVerifier::new(outcome)),
+            http: reqwest::Client::new(),
         }
     }
 
-    /// Fetch a live challenge from the router and sign it with `dk`, returning the headers a real
-    /// admin request would carry. This exercises the full GET /admin/challenge -> sign -> verify path.
-    async fn signed_admin_headers(app: &Router, dk: &DeviceKey) -> Vec<(String, String)> {
-        let req = Request::builder()
-            .uri("/admin/challenge")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let j = body_json(resp).await;
-        let aud = j["aud"].as_str().unwrap().to_string();
-        let nonce = j["nonce"].as_str().unwrap().to_string();
-        let ts = j["ts"].as_str().unwrap().to_string();
-        let sig = sign_challenge(dk, &aud, &nonce, &ts).unwrap();
+    /// The five device-signed headers a real console sends; values are arbitrary because the mock
+    /// verifier decides the verdict, not their content.
+    fn signed_headers() -> Vec<(String, String)> {
         vec![
-            ("x-ce-device-id".into(), dk.id.clone()),
-            ("x-ce-auth".into(), sig),
-            ("x-ce-aud".into(), aud),
-            ("x-ce-nonce".into(), nonce),
-            ("x-ce-ts".into(), ts),
+            ("x-ce-device-id".into(), "dev-abc".into()),
+            ("x-ce-auth".into(), "sig-xyz".into()),
+            ("x-ce-aud".into(), "ce-watch".into()),
+            ("x-ce-nonce".into(), "nonce-1".into()),
+            ("x-ce-ts".into(), "2026-06-24T00:00:00.000Z".into()),
         ]
     }
 
-    fn with_headers(mut b: axum::http::request::Builder, headers: &[(String, String)]) -> axum::http::request::Builder {
+    fn with_headers(
+        mut b: axum::http::request::Builder,
+        headers: &[(String, String)],
+    ) -> axum::http::request::Builder {
         for (k, v) in headers {
             b = b.header(k.as_str(), v.as_str());
         }
@@ -616,7 +401,7 @@ mod tests {
     #[tokio::test]
     async fn ingest_rejects_bad_token() {
         let dir = temp_dir();
-        let app = router(state_with(dir.clone()));
+        let app = router(state_with(dir.clone(), MockOutcome::Deny));
         let req = Request::builder()
             .method("POST")
             .uri("/ingest")
@@ -632,7 +417,7 @@ mod tests {
     #[tokio::test]
     async fn ingest_accepts_good_token_and_stores() {
         let dir = temp_dir();
-        let st = state_with(dir.clone());
+        let st = state_with(dir.clone(), MockOutcome::Deny);
         let app = router(st.clone());
         let req = Request::builder()
             .method("POST")
@@ -644,46 +429,42 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // It is now queryable and the unseen counter incremented.
         assert_eq!(st.store.head_seq(), 1);
         assert_eq!(st.store.unseen(), 1);
         let flags = st.store.query(None, None, None, None, 10);
         assert_eq!(flags.len(), 1);
         assert_eq!(flags[0].event.heuristic, "H2");
 
-        // The line was actually written to disk.
         let log = dir.join("flags.jsonl");
         let contents = std::fs::read_to_string(&log).unwrap();
         assert!(contents.contains("count_primes"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ---- relying-party admin auth (delegates to ce-auth /verify) ----
+
     #[tokio::test]
-    async fn admin_flags_requires_device_auth() {
+    async fn admin_flags_missing_headers_is_401() {
         let dir = temp_dir();
-        let app = router(state_with(dir.clone()));
-
-        // No auth headers → 401.
-        let req = Request::builder()
-            .uri("/admin/flags")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
+        let app = router(state_with(
+            dir.clone(),
+            MockOutcome::Ok { device_id: "d".into(), role: "admin".into() },
+        ));
+        // No device-signed headers → 401 before ce-auth is even consulted.
+        let req = Request::builder().uri("/admin/flags").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        // The OLD pasted-token path is gone: an x-ce-admin bearer header is no longer honored.
-        let req = Request::builder()
-            .uri("/admin/flags")
-            .header("x-ce-admin", "admin-secret")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-        // A valid signed challenge from the ENROLLED device → 200 (admitted).
-        let dk = test_device();
-        let headers = signed_admin_headers(&app, &dk).await;
-        let req = with_headers(Request::builder().uri("/admin/flags"), &headers)
+    #[tokio::test]
+    async fn admin_flags_ce_auth_ok_admits() {
+        let dir = temp_dir();
+        let app = router(state_with(
+            dir.clone(),
+            MockOutcome::Ok { device_id: "dev-abc".into(), role: "admin".into() },
+        ));
+        let req = with_headers(Request::builder().uri("/admin/flags"), &signed_headers())
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -692,45 +473,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_rejects_unenrolled_device() {
-        // A device that is NOT an admin — empty store, nobody claimed — is rejected from /admin/flags
-        // even with a perfectly valid signature over a live challenge (key-valid != is-admin). It has
-        // no persisted pub, so even key-resolution falls through to 401 here.
+    async fn admin_flags_ce_auth_deny_is_401() {
         let dir = temp_dir();
-        let st = state_empty(dir.clone());
+        let app = router(state_with(dir.clone(), MockOutcome::Deny));
+        let req = with_headers(Request::builder().uri("/admin/flags"), &signed_headers())
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn admin_flags_ce_auth_down_is_503() {
+        let dir = temp_dir();
+        let app = router(state_with(dir.clone(), MockOutcome::Down));
+        let req = with_headers(Request::builder().uri("/admin/flags"), &signed_headers())
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn verifier_receives_forwarded_signed_headers() {
+        // The handler must forward the device-signed headers off the request to the verifier
+        // verbatim, so ce-auth can re-derive the nonce and check the signature. We hold a typed
+        // handle to the mock so we can read exactly what it was asked to verify.
+        let dir = temp_dir();
+        let mock = Arc::new(MockVerifier::new(MockOutcome::Ok {
+            device_id: "dev-abc".into(),
+            role: "admin".into(),
+        }));
+        let st = AppState {
+            store: Arc::new(Store::open(dir.clone()).expect("open store")),
+            ingest_token: Arc::new(Some("ingest-secret".to_string())),
+            ce_auth_url: Arc::new("http://127.0.0.1:0".to_string()),
+            verifier: mock.clone(),
+            http: reqwest::Client::new(),
+        };
         let app = router(st);
-        let dk = test_device();
-        let headers = signed_admin_headers(&app, &dk).await;
-        let req = with_headers(Request::builder().uri("/admin/flags"), &headers)
+        let req = with_headers(Request::builder().uri("/admin/unseen"), &signed_headers())
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let seen = mock.seen.lock().unwrap().clone().expect("verifier was called");
+        assert_eq!(seen.device_id, "dev-abc");
+        assert_eq!(seen.sig, "sig-xyz");
+        assert_eq!(seen.aud, "ce-watch");
+        assert_eq!(seen.nonce, "nonce-1");
+        assert_eq!(seen.ts, "2026-06-24T00:00:00.000Z");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
-    async fn admin_rejects_tampered_signature() {
+    async fn seen_clears_unseen_when_admitted() {
         let dir = temp_dir();
-        let app = router(state_with(dir.clone()));
-        let dk = test_device();
-        let mut headers = signed_admin_headers(&app, &dk).await;
-        // Corrupt the signature header (x-ce-auth is index 1).
-        let sig = &mut headers[1].1;
-        let last = sig.pop().unwrap();
-        sig.push(if last == 'A' { 'B' } else { 'A' });
-        let req = with_headers(Request::builder().uri("/admin/flags"), &headers)
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn seen_clears_unseen() {
-        let dir = temp_dir();
-        let st = state_with(dir.clone());
+        let st = state_with(
+            dir.clone(),
+            MockOutcome::Ok { device_id: "dev-abc".into(), role: "admin".into() },
+        );
         for _ in 0..3 {
             let ev: FlagEvent = serde_json::from_value(sample_flag()).unwrap();
             st.store.append(ev).unwrap();
@@ -738,11 +543,12 @@ mod tests {
         assert_eq!(st.store.unseen(), 3);
 
         let app = router(st.clone());
-        let dk = test_device();
-        let headers = signed_admin_headers(&app, &dk).await;
-        let req = with_headers(Request::builder().method("POST").uri("/admin/seen"), &headers)
-            .body(Body::empty())
-            .unwrap();
+        let req = with_headers(
+            Request::builder().method("POST").uri("/admin/seen"),
+            &signed_headers(),
+        )
+        .body(Body::empty())
+        .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(st.store.unseen(), 0);
@@ -750,10 +556,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn seen_denied_does_not_clear_unseen() {
+        // A denied admin must NOT be able to clear the unseen counter.
+        let dir = temp_dir();
+        let st = state_with(dir.clone(), MockOutcome::Deny);
+        let ev: FlagEvent = serde_json::from_value(sample_flag()).unwrap();
+        st.store.append(ev).unwrap();
+        assert_eq!(st.store.unseen(), 1);
+
+        let app = router(st.clone());
+        let req = with_headers(
+            Request::builder().method("POST").uri("/admin/seen"),
+            &signed_headers(),
+        )
+        .body(Body::empty())
+        .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(st.store.unseen(), 1); // unchanged
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn admin_challenge_proxies_ce_auth() {
+        // Stand up a tiny stub ce-auth that serves GET /challenge?aud=ce-watch, point ce-watch at it,
+        // and assert /admin/challenge returns the stub's body verbatim.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stub_addr = listener.local_addr().unwrap();
+        let stub = Router::new().route(
+            "/challenge",
+            get(|Query(q): Query<std::collections::HashMap<String, String>>| async move {
+                assert_eq!(q.get("aud").map(String::as_str), Some("ce-watch"));
+                Json(json!({
+                    "aud": "ce-watch",
+                    "nonce": "abcd1234",
+                    "ts": "2026-06-24T00:00:00.000Z"
+                }))
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, stub).await.unwrap();
+        });
+
+        let dir = temp_dir();
+        let mut st = state_with(dir.clone(), MockOutcome::Deny);
+        st.ce_auth_url = Arc::new(format!("http://{}", stub_addr));
+        let app = router(st);
+
+        let req = Request::builder().uri("/admin/challenge").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        assert_eq!(j["aud"], "ce-watch");
+        assert_eq!(j["nonce"], "abcd1234");
+        assert_eq!(j["ts"], "2026-06-24T00:00:00.000Z");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn admin_challenge_ce_auth_down_is_503() {
+        // Point at a closed port → proxy fails → fail closed (503).
+        let dir = temp_dir();
+        let mut st = state_with(dir.clone(), MockOutcome::Deny);
+        st.ce_auth_url = Arc::new("http://127.0.0.1:1".to_string());
+        let app = router(st);
+        let req = Request::builder().uri("/admin/challenge").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn log_survives_restart() {
         let dir = temp_dir();
         {
-            let st = state_with(dir.clone());
+            let st = state_with(dir.clone(), MockOutcome::Deny);
             for i in 0..5 {
                 let mut v = sample_flag();
                 v["ts"] = json!(1_700_000_000u64 + i);
@@ -761,228 +638,20 @@ mod tests {
                 st.store.append(ev).unwrap();
             }
             assert_eq!(st.store.head_seq(), 5);
-        } // store dropped — simulate process exit
+        }
 
-        // Reopen: the durable log is replayed.
-        let st2 = state_with(dir.clone());
+        let st2 = state_with(dir.clone(), MockOutcome::Deny);
         assert_eq!(st2.store.head_seq(), 5);
         let flags = st2.store.query(None, None, None, None, 100);
         assert_eq!(flags.len(), 5);
-        // Newest-first ordering preserved across restart.
         assert!(flags[0].seq > flags[1].seq);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // ---- self-service admin enrollment ----
-
-    /// Sign a live challenge and return the admin headers, exactly as a real device would.
-    async fn signed_headers(app: &Router, dk: &DeviceKey) -> Vec<(String, String)> {
-        signed_admin_headers(app, dk).await
-    }
-
-    #[tokio::test]
-    async fn first_claim_makes_admin_second_claim_conflicts() {
-        let dir = temp_dir();
-        let st = state_empty(dir.clone());
-        let app = router(st.clone());
-        let dk = test_device();
-        let pub_b64 = compact_pub(&dk);
-
-        // First claim on an empty store -> 200, device becomes admin.
-        let headers = signed_headers(&app, &dk).await;
-        let body = json!({ "pub": pub_b64 }).to_string();
-        let req = with_headers(
-            Request::builder().method("POST").uri("/admin/claim").header("content-type", "application/json"),
-            &headers,
-        )
-        .body(Body::from(body.clone()))
-        .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert!(st.admins.is_admin(&dk.id));
-
-        // Second claim (store now has an admin) -> 409.
-        let headers = signed_headers(&app, &dk).await;
-        let req = with_headers(
-            Request::builder().method("POST").uri("/admin/claim").header("content-type", "application/json"),
-            &headers,
-        )
-        .body(Body::from(body))
-        .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn request_then_approve_grants_flags_access_and_revoke_removes_it() {
-        // Admin (seeded) device.
-        let dir = temp_dir();
-        let st = state_with(dir.clone());
-        let app = router(st.clone());
-        let admin = test_device();
-
-        // A second, distinct device requests access.
-        let requester = second_device();
-        let req_pub = compact_pub(&requester);
-
-        // Before approval: key-valid but NOT admin -> /admin/flags is 401.
-        let headers = signed_headers(&app, &requester).await;
-        // requester is unknown to the store; flags needs role=admin -> rejected.
-        let req = with_headers(Request::builder().uri("/admin/flags"), &headers)
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-        // It can /admin/request (recorded as pending, with its pub).
-        let headers = signed_headers(&app, &requester).await;
-        let body = json!({ "label": "leif-phone", "pub": req_pub }).to_string();
-        let req = with_headers(
-            Request::builder().method("POST").uri("/admin/request").header("content-type", "application/json"),
-            &headers,
-        )
-        .body(Body::from(body))
-        .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(st.admins.role_of(&requester.id), "pending");
-
-        // The admin lists devices and sees the pending requester.
-        let headers = signed_headers(&app, &admin).await;
-        let req = with_headers(Request::builder().uri("/admin/devices"), &headers)
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let j = body_json(resp).await;
-        assert_eq!(j["pending"].as_array().unwrap().len(), 1);
-
-        // The admin approves it.
-        let headers = signed_headers(&app, &admin).await;
-        let body = json!({ "deviceId": requester.id }).to_string();
-        let req = with_headers(
-            Request::builder().method("POST").uri("/admin/devices/approve").header("content-type", "application/json"),
-            &headers,
-        )
-        .body(Body::from(body))
-        .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert!(st.admins.is_admin(&requester.id));
-
-        // Now the requester CAN read /admin/flags (200).
-        let headers = signed_headers(&app, &requester).await;
-        let req = with_headers(Request::builder().uri("/admin/flags"), &headers)
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        // The admin revokes the requester -> access removed.
-        let headers = signed_headers(&app, &admin).await;
-        let body = json!({ "deviceId": requester.id }).to_string();
-        let req = with_headers(
-            Request::builder().method("POST").uri("/admin/devices/revoke").header("content-type", "application/json"),
-            &headers,
-        )
-        .body(Body::from(body))
-        .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(st.admins.role_of(&requester.id), "none");
-
-        // Revoked device is back to 401 on flags.
-        let headers = signed_headers(&app, &requester).await;
-        let req = with_headers(Request::builder().uri("/admin/flags"), &headers)
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn cannot_revoke_last_admin() {
-        let dir = temp_dir();
-        let st = state_with(dir.clone()); // exactly one seeded admin
-        let app = router(st.clone());
-        let admin = test_device();
-
-        let headers = signed_headers(&app, &admin).await;
-        let body = json!({ "deviceId": admin.id }).to_string();
-        let req = with_headers(
-            Request::builder().method("POST").uri("/admin/devices/revoke").header("content-type", "application/json"),
-            &headers,
-        )
-        .body(Body::from(body))
-        .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert!(st.admins.is_admin(&admin.id)); // still there
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn env_seeded_admin_still_works() {
-        // A device seeded via the env (state_with mirrors CE_WATCH_ADMIN_DEVICES) is admin and can
-        // read /admin/flags immediately, with no claim step.
-        let dir = temp_dir();
-        let st = state_with(dir.clone());
-        let app = router(st);
-        let dk = test_device();
-        let headers = signed_headers(&app, &dk).await;
-        let req = with_headers(Request::builder().uri("/admin/flags"), &headers)
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn admin_store_survives_reload() {
-        let dir = temp_dir();
-        let requester = second_device();
-        {
-            let st = state_with(dir.clone());
-            // Record the requester as pending, then approve it.
-            st.admins.request(&requester.id, &compact_pub(&requester), "x").unwrap();
-            assert!(st.admins.approve(&requester.id).unwrap());
-            assert!(st.admins.is_admin(&requester.id));
-        } // dropped — simulate restart
-
-        // Reopen with NO seed: the persisted file is the source of truth.
-        let admins = AdminStore::open(&dir, &[]).unwrap();
-        assert!(admins.is_admin(&requester.id));
-        assert!(admins.is_admin(&test_device().id)); // the seeded admin persisted too
-        assert_eq!(admins.admin_count(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn me_reports_role() {
-        let dir = temp_dir();
-        let st = state_with(dir.clone());
-        let app = router(st);
-        let dk = test_device();
-        let headers = signed_headers(&app, &dk).await;
-        let req = with_headers(Request::builder().uri("/admin/me"), &headers)
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let j = body_json(resp).await;
-        assert_eq!(j["role"], "admin");
-        assert_eq!(j["hasAdmins"], true);
-        assert_eq!(j["deviceId"], dk.id);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn filters_apply() {
         let dir = temp_dir();
-        let st = state_with(dir.clone());
+        let st = state_with(dir.clone(), MockOutcome::Deny);
         let mut a = sample_flag();
         a["heuristic"] = json!("H1");
         a["severity"] = json!("low");

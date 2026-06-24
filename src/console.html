@@ -135,13 +135,15 @@
 <body>
 <div id="app"></div>
 <script>
-// ce-watch admin auth — ce-secrets challenge-response, inlined WebCrypto (byte-exact with the
-// canonical crypto.mjs / auth.mjs and the Rust SDK). The operator's device key lives in
-// localStorage. Enrollment is SELF-SERVICE: the first device to open the console Claims it (TOFU);
-// any later device Requests access and an existing admin Approves it in-console. No env editing, no
-// redeploy, no pasted token, ever.
+// ce-watch admin auth — ce-auth challenge-response, inlined WebCrypto (byte-exact with the canonical
+// crypto.mjs / auth.mjs and the Rust SDK). The operator's device key lives in localStorage. ce-watch
+// is a RELYING PARTY: device enrollment, claim, request, approve and revoke all live in ce-auth
+// (auth.ce-net.com). This console only signs a challenge and presents the device-signed headers; if
+// this device isn't an enrolled admin, ce-auth denies it and we show a "manage at ce-auth" screen.
 const LS_DEVICE = "ce-watch-device-key";
 const AUD = "ce-watch";
+// Where the operator manages their devices. ce-watch no longer has any device-management UI.
+const CE_AUTH_CONSOLE = "https://auth.ce-net.com";
 const subtle = globalThis.crypto.subtle;
 let device = null;   // { ecdhPriv, ecdhPub, ecdsaPriv, ecdsaPub, id }
 let lastHead = 0;
@@ -187,13 +189,6 @@ async function loadOrCreateDevice() {
   localStorage.setItem(LS_DEVICE, JSON.stringify(dk));
   return dk;
 }
-// The compact ECDSA SEC1 pub this device advertises in claim/request bodies so the server can both
-// verify our signature and persist the key: b64url(04 || ecdsaPub.x || ecdsaPub.y).
-function compactPub(dk) {
-  const x = b64u.dec(dk.ecdsaPub.x), y = b64u.dec(dk.ecdsaPub.y);
-  const raw = new Uint8Array(65); raw[0] = 0x04; raw.set(x, 1); raw.set(y, 33);
-  return b64u.enc(raw);
-}
 // Sign the flat canonical body { aud, deviceId, nonce, ts } -> base64url(raw P1363 64-byte sig).
 async function signChallenge(dk, aud, nonce, ts) {
   const priv = await subtle.importKey("jwk", dk.ecdsaPriv, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
@@ -216,83 +211,42 @@ function h(tag, attrs, kids) {
   return e;
 }
 
-// The first-run screen: the store has ZERO admins, so this (key-valid) device may CLAIM the console
-// and become the first admin (TOFU). Safe because the operator claims right after deploy.
-function claimScreen(msg) {
+// The "this device isn't authorized" screen. ce-watch holds no device registry — enrollment and
+// approval happen in ce-auth. We show the device id (so the operator can enroll it there) and a link
+// to the ce-auth console. No claim / request / approve UI lives here anymore.
+function unauthorizedScreen(msg) {
   const app = document.getElementById("app");
   app.innerHTML = "";
   const id = device ? device.id : "(generating…)";
   app.append(h("div", { class: "gate" }, [
-    h("h1", {}, ["ce-watch // first run"]),
+    h("h1", {}, ["ce-watch // not authorized"]),
     h("p", {}, [
-      "No admin is enrolled yet. This browser holds a fresh device key — claim the console to ",
-      "become its first admin. After that you approve any further devices right here, with no ",
-      "server config and no redeploy.",
+      "This device isn't authorized. Manage your devices at ",
+      h("a", { href: CE_AUTH_CONSOLE, target: "_blank", rel: "noreferrer" }, ["auth.ce-net.com"]),
+      ".",
     ]),
     h("div", { class: "err" }, [msg || ""]),
     h("div", { class: "enroll" }, [
       h("div", { class: "lbl" }, ["this device id"]),
       h("code", {}, [id]),
     ]),
-    h("button", { onclick: doClaim }, ["claim this console"]),
+    h("button", { onclick: boot }, ["retry"]),
   ]));
 }
 
-// The "admins exist but you are not one" screen: this device can REQUEST access; an existing admin
-// then approves it in their Devices panel. We show the device id so the operator can dictate it.
-function requestScreen(msg, role) {
+// The "auth service unavailable" screen — ce-auth is unreachable, so ce-watch fails closed. The
+// operator just retries once ce-auth is back.
+function authDownScreen() {
   const app = document.getElementById("app");
   app.innerHTML = "";
-  const id = device ? device.id : "(generating…)";
-  const pendingNote = role === "pending"
-    ? "Your request is recorded and pending. Ask an existing admin to approve this device id below."
-    : "";
   app.append(h("div", { class: "gate" }, [
-    h("h1", {}, ["ce-watch // request access"]),
+    h("h1", {}, ["ce-watch // auth unavailable"]),
     h("p", {}, [
-      "This console already has an admin. Request access from this device — an existing admin ",
-      "approves it in their Devices panel. No token, no env editing.",
+      "The auth service (ce-auth) is unreachable, so this console can't verify your device right ",
+      "now. This is fail-closed by design. Try again once ce-auth is back.",
     ]),
-    h("div", { class: "err" }, [msg || ""]),
-    h("div", { class: "enroll" }, [
-      h("div", { class: "lbl" }, ["label (optional)"]),
-      h("input", { id: "req-label", placeholder: "e.g. leif-laptop" }),
-      h("div", { class: "lbl", style: "margin-top:10px" }, ["your device id — give this to an admin"]),
-      h("code", {}, [id]),
-    ]),
-    h("div", { class: "ip", style: "margin:10px 0 14px" }, [pendingNote]),
-    h("button", { onclick: doRequest }, [role === "pending" ? "re-send request" : "request access"]),
-    h("button", { onclick: boot, style: "margin-left:8px" }, ["refresh"]),
+    h("button", { onclick: boot }, ["retry"]),
   ]));
-}
-
-// POST /admin/claim with this device's pub. On success this device is now admin -> boot into console.
-async function doClaim() {
-  try {
-    const r = await api("/admin/claim", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ pub: compactPub(device) }),
-    });
-    if (r.status === 409) { boot(); return; }              // someone claimed first — re-evaluate
-    if (!r.ok) { claimScreen("claim failed"); return; }
-    boot();
-  } catch (e) { claimScreen("could not reach the server"); }
-}
-
-// POST /admin/request with this device's pub + optional label. Records us as pending.
-async function doRequest() {
-  const labelEl = document.getElementById("req-label");
-  const label = labelEl ? labelEl.value.trim() : "";
-  try {
-    const r = await api("/admin/request", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ pub: compactPub(device), label }),
-    });
-    if (!r.ok) { requestScreen("request failed", "none"); return; }
-    requestScreen("request sent — pending an admin's approval", "pending");
-  } catch (e) { requestScreen("could not reach the server", "none"); }
 }
 
 // Attach a freshly signed challenge to a request. Fetches /admin/challenge, signs it with the device
@@ -331,9 +285,10 @@ function renderShell() {
         h("span", { id: "unseen-label", class: "ip" }, ["0 unseen"]),
       ]),
       h("button", { class: "danger", onclick: markSeen }, ["mark seen"]),
-      h("button", { onclick: openDevices }, ["devices"]),
+      h("a", { href: CE_AUTH_CONSOLE, target: "_blank", rel: "noreferrer" }, [
+        h("button", {}, ["manage devices"]),
+      ]),
     ]),
-    h("div", { id: "devices-panel" }, []),
     h("div", { class: "bar" }, [
       h("label", {}, ["heuristic"]),
       sel("f-heur", ["", "H1","H2","H3","H4","H5","H6"]),
@@ -373,68 +328,6 @@ function markSeen() {
   api("/admin/seen", { method: "POST" }).then(updateUnseen);
 }
 
-// ---- Devices panel (admin only): active admins + pending requests with Approve / Revoke ----
-let devicesOpen = false;
-function openDevices() {
-  devicesOpen = !devicesOpen;
-  if (devicesOpen) loadDevices();
-  else { const p = document.getElementById("devices-panel"); if (p) p.innerHTML = ""; }
-}
-async function loadDevices() {
-  const panel = document.getElementById("devices-panel");
-  if (!panel) return;
-  panel.innerHTML = "";
-  let j;
-  try {
-    const r = await api("/admin/devices");
-    if (!r.ok) { panel.append(h("div", { class: "dev-wrap" }, ["could not load devices"])); return; }
-    j = await r.json();
-  } catch (e) { return; }
-  renderDevices(panel, j);
-}
-function deviceRow(d, kind) {
-  const isMe = device && d.deviceId === device.id;
-  const meta = (d.label ? d.label + " · " : "") + d.deviceId + (isMe ? " (this device)" : "");
-  const actions = [];
-  if (kind === "pending") {
-    actions.push(h("button", { onclick: () => approveDevice(d.deviceId) }, ["approve"]));
-  }
-  // Never offer to revoke yourself if you are the only admin; the server enforces it too.
-  actions.push(h("button", { class: "danger", onclick: () => revokeDevice(d.deviceId) }, ["revoke"]));
-  return h("div", { class: "dev-row" }, [
-    h("div", { class: "dev-id mono" }, [meta]),
-    h("div", { class: "dev-actions" }, actions),
-  ]);
-}
-function renderDevices(panel, j) {
-  const admins = j.admins || [], pending = j.pending || [];
-  const adminRows = admins.length
-    ? admins.map((d) => deviceRow(d, "admin"))
-    : [h("div", { class: "ip" }, ["none"])];
-  const pendRows = pending.length
-    ? pending.map((d) => deviceRow(d, "pending"))
-    : [h("div", { class: "ip" }, ["no pending requests"])];
-  panel.append(h("div", { class: "dev-wrap" }, [
-    h("div", { class: "dev-col" }, [ h("div", { class: "dev-h" }, ["admins (" + admins.length + ")"]), ...adminRows ]),
-    h("div", { class: "dev-col" }, [ h("div", { class: "dev-h" }, ["pending (" + pending.length + ")"]), ...pendRows ]),
-  ]));
-}
-async function approveDevice(id) {
-  try { await api("/admin/devices/approve", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ deviceId: id }) }); }
-  catch (e) {}
-  loadDevices();
-}
-async function revokeDevice(id) {
-  try {
-    const r = await api("/admin/devices/revoke", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ deviceId: id }) });
-    if (!r.ok) {
-      const j = await r.json().catch(() => ({}));
-      alert(j.error || "revoke failed");
-    }
-  } catch (e) {}
-  loadDevices();
-}
-
 async function updateUnseen() {
   try {
     const r = await api("/admin/unseen");
@@ -464,8 +357,10 @@ async function refresh(replace) {
   let r;
   try { r = await api("/admin/flags?" + qs.toString()); }
   catch (e) { return; }
-  // Our admin role was revoked while the console was open -> drop back to the access flow.
-  if (r.status === 401) { if (window._ceTimer) { clearInterval(window._ceTimer); window._ceTimer = null; } boot(); return; }
+  // Our device was de-authorized in ce-auth (or ce-auth went down) while the console was open ->
+  // stop polling and drop back to the appropriate gate screen.
+  if (r.status === 401 || r.status === 403) { stopTimer(); unauthorizedScreen(""); return; }
+  if (r.status === 503) { stopTimer(); authDownScreen(); return; }
   if (!r.ok) return;
   const j = await r.json();
 
@@ -514,29 +409,30 @@ function where(f) {
   return s.endpoint || s.func || s.chosen_node || s.target || "—";
 }
 
+function stopTimer() {
+  if (window._ceTimer) { clearInterval(window._ceTimer); window._ceTimer = null; }
+}
+
 async function boot() {
   if (!device) device = await loadOrCreateDevice();
-  // Ask the server who we are: GET /admin/me reports our role from the persisted admin store and
-  // whether any admin exists yet. This proves device-key possession (key-valid) and picks the screen.
-  let me;
+  // ce-watch is a relying party: there's no /admin/me and no local role. Just try /admin/flags with
+  // a freshly signed challenge. ce-auth decides: 200 admits, 401/403 -> not authorized (manage in
+  // ce-auth), 503 -> auth service down (fail-closed).
+  stopTimer();
+  let r;
   try {
-    const r = await api("/admin/me");
-    if (!r.ok) { claimScreen("could not authenticate this device"); return; }
-    me = await r.json();
-  } catch (e) { claimScreen("could not reach the server"); return; }
+    r = await api("/admin/flags");
+  } catch (e) { authDownScreen(); return; }
 
-  if (me.role === "admin") {
-    devicesOpen = false;
+  if (r.ok) {
     renderShell();
     refresh(true);
-    if (window._ceTimer) clearInterval(window._ceTimer);
     window._ceTimer = setInterval(() => refresh(false), 4000);
     return;
   }
-  // Not an admin. First ever device -> claim; otherwise request access (showing pending state).
-  if (window._ceTimer) { clearInterval(window._ceTimer); window._ceTimer = null; }
-  if (!me.hasAdmins) { claimScreen(""); return; }
-  requestScreen("", me.role); // role is "pending" or "none"
+  if (r.status === 503) { authDownScreen(); return; }
+  // 401 / 403 / anything else: this device isn't an enrolled admin in ce-auth.
+  unauthorizedScreen("");
 }
 
 boot();

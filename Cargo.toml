@@ -2,7 +2,7 @@
 name = "ce-watch"
 version = "0.1.0"
 edition = "2024"
-description = "ce-watch — operator security console for CE: durable append-only flag log, token-gated ingest, and an admin-only dark dashboard. Light axum service that lives beside the relay."
+description = "ce-watch — operator security console for CE: durable append-only flag log, token-gated ingest, and an admin-only dark dashboard. Light axum service beside the relay; a thin relying party of ce-auth for admin device-auth (no local device registry)."
 
 [[bin]]
 name = "ce-watch"
@@ -17,11 +17,10 @@ serde_json = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-ce-secrets-rs = { path = "../ce-secrets-rs" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }
-ce-secrets-rs = { path = "../ce-secrets-rs" }
 
 [profile.release]
 opt-level = 2

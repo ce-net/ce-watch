@@ -12,29 +12,54 @@ touches the `ce` node directly — the hub pushes flags to it over HTTP, and the
 1. **`POST /ingest`** — receives one `FlagEvent` from the hub's abuse detector. Gated by the header
    `x-ce-watch-token` matching `CE_WATCH_INGEST_TOKEN`. The event is appended durably (fsync) to
    `flags.jsonl` and the unseen counter is incremented.
-2. **Admin console** — `GET /` (and `/admin`) serve a single-page dark "security console". It
-   prompts once for the admin token, stores it in `localStorage`, and sends it as `x-ce-admin` on
-   every data call. The page renders the flag log as a structured, filterable table:
+2. **Admin console** — `GET /` (and `/admin`) serve a single-page dark "security console". The page
+   holds the operator's device key in `localStorage`, fetches a challenge, signs it, and sends the
+   device-signed headers on every data call. ce-watch is a **relying party of ce-auth**: it forwards
+   those headers to ce-auth's `POST /verify` and admits iff `{ok:true}`. The page renders the flag
+   log as a structured, filterable table:
    - **WHO** — `node_id` (Ed25519 pubkey hex, or `ip:<addr>` for unsigned nodes) + source `ip`
    - **WHERE** — chosen node / endpoint / func (pulled from the sample)
    - **WHEN** — timestamp, newest first
    - **WHY** — heuristic tag + human reason + severity
    - Filter by heuristic / severity / node. A **red unseen-count dot** pulses while there are
      unacknowledged flags and clears on **mark seen**.
-3. **`GET /admin/flags?since=&heuristic=&severity=&node=`** — token-gated JSON feed powering the
-   UI. `since` is an exclusive sequence cursor for incremental polling.
-4. **`GET /admin/unseen`** / **`POST /admin/seen`** — read / clear the unseen watermark.
+3. **`GET /admin/challenge`** — proxies ce-auth's `GET /challenge?aud=ce-watch` verbatim so the
+   console never needs ce-auth's address. 503 if ce-auth is unreachable.
+4. **`GET /admin/flags?since=&heuristic=&severity=&node=`** — device-auth-gated JSON feed powering
+   the UI. `since` is an exclusive sequence cursor for incremental polling.
+5. **`GET /admin/unseen`** / **`POST /admin/seen`** — read / clear the unseen watermark.
+
+ce-watch holds **no device registry and no in-process crypto**. Device enrollment, claim, request,
+approve and revoke all live in **ce-auth** (`auth.ce-net.com`). A device enrolled there == the
+operator == trusted by ce-watch.
+
+## Admin auth (relying party of ce-auth)
+
+Every admin request carries the device-signed headers `x-ce-device-id`, `x-ce-auth`, `x-ce-aud`,
+`x-ce-nonce`, `x-ce-ts`. ce-watch forwards them to ce-auth:
+
+```
+POST {CE_AUTH_URL}/verify  { aud: "ce-watch", deviceId, sig, nonce, ts }  -> { ok, role, deviceId }
+```
+
+- `{ok:true}` → admitted (200).
+- `{ok:false}` or missing headers → 401.
+- ce-auth unreachable → **503, fail-closed** (an auth outage never admits).
+
+If this device isn't enrolled, the console shows a clean "manage your devices at auth.ce-net.com"
+screen with the device id — there is no claim/approve UI in ce-watch anymore.
 
 ## Environment
 
 | Var | Default | Purpose |
 |---|---|---|
 | `CE_WATCH_INGEST_TOKEN` | _(unset → /ingest rejects all)_ | Shared secret the hub sends as `x-ce-watch-token`. |
-| `CE_WATCH_ADMIN_TOKEN` | _(unset → admin rejects all)_ | Operator token for the console (`x-ce-admin`). |
+| `CE_AUTH_URL` | `http://127.0.0.1:8972` | Base URL of ce-auth, the device-auth authority for the console. |
 | `PORT` | `8971` | Listen port. |
 | `CE_WATCH_DATA_DIR` | `./ce-watch-data` | Directory holding `flags.jsonl`. |
 
-If a token is unset the corresponding surface refuses every request (fail-closed).
+If `CE_WATCH_INGEST_TOKEN` is unset, `/ingest` refuses every request (fail-closed). If ce-auth is
+unreachable, every admin surface returns 503 (fail-closed).
 
 ## Durability & bounds
 
@@ -72,7 +97,7 @@ Errors are ignored (fire-and-forget). ce-watch is a sink, not a dependency.
 ## Run
 
 ```bash
-CE_WATCH_INGEST_TOKEN=… CE_WATCH_ADMIN_TOKEN=… PORT=8971 \
+CE_WATCH_INGEST_TOKEN=… CE_AUTH_URL=http://127.0.0.1:8972 PORT=8971 \
   cargo run --release
 ```
 
@@ -82,9 +107,11 @@ CE_WATCH_INGEST_TOKEN=… CE_WATCH_ADMIN_TOKEN=… PORT=8971 \
 cargo test
 ```
 
-Covers: `/ingest` rejects a bad token (401) and accepts + stores a good one; `/admin/flags`
-requires the admin token; `mark seen` clears the unseen count; the log survives restart; filters
-apply.
+Covers: `/ingest` rejects a bad token (401) and accepts + stores a good one; the admin endpoints
+delegate to ce-auth's `/verify` (mock verifier) — `{ok:true}` admits (200), `{ok:false}` is 401,
+ce-auth-down is 503, and the device-signed headers are forwarded verbatim; `/admin/challenge`
+proxies ce-auth (and 503s when it is down); `mark seen` clears the unseen count only when admitted;
+the log survives restart; filters apply.
 
 ## Deploy (on the relay, behind nginx, admin-only)
 
@@ -109,7 +136,7 @@ After=network.target
 
 [Service]
 Environment=CE_WATCH_INGEST_TOKEN=…
-Environment=CE_WATCH_ADMIN_TOKEN=…
+Environment=CE_AUTH_URL=http://127.0.0.1:8972
 Environment=PORT=8971
 Environment=CE_WATCH_DATA_DIR=/var/lib/ce-watch
 ExecStart=/usr/local/bin/ce-watch
@@ -119,5 +146,6 @@ Restart=always
 WantedBy=multi-user.target
 ```
 
-The console is **admin-only** by design — there is no public surface. Keep both tokens secret and
-prefer additional network-level restriction at nginx.
+The console is **admin-only** by design — there is no public surface. Admin access is gated by
+ce-auth device-auth (point `CE_AUTH_URL` at the local ce-auth sidecar); keep the ingest token secret
+and prefer additional network-level restriction at nginx.
