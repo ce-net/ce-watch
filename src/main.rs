@@ -9,7 +9,13 @@
 //!
 //! It deliberately holds NO libp2p / wasmtime / heavy deps — it is purely an HTTP sink + dashboard.
 //! The node and hub stay the source of truth for the mesh; ce-watch is the operator's read model.
+//!
+//! Admin auth is the ce-secrets challenge-response primitive (see `auth`): the operator enrolls
+//! their device's public key ONCE at deploy via `CE_WATCH_ADMIN_DEVICES`, then every request proves
+//! possession of the matching private key over a fresh signed challenge. There is no pasted bearer
+//! token. `/ingest` keeps its own shared-secret header (it is a server-to-server sink).
 
+mod auth;
 mod store;
 
 use std::net::SocketAddr;
@@ -25,6 +31,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tower_http::cors::CorsLayer;
 
+use auth::Devices;
 use store::{FlagEvent, Store};
 
 const CONSOLE_HTML: &str = include_str!("console.html");
@@ -33,7 +40,12 @@ const CONSOLE_HTML: &str = include_str!("console.html");
 struct AppState {
     store: Arc<Store>,
     ingest_token: Arc<Option<String>>,
-    admin_token: Arc<Option<String>>,
+    /// Enrolled operator devices (deviceId -> ECDSA public JWK) for challenge-response admin auth.
+    devices: Arc<Devices>,
+    /// Stateless-nonce HMAC key. Persisted across a process restart only if `CE_WATCH_SERVER_SECRET`
+    /// is set; otherwise a fresh random secret is minted per boot (in-flight challenges from before a
+    /// restart simply expire, which is the safe default).
+    server_secret: Arc<Vec<u8>>,
 }
 
 #[tokio::main]
@@ -49,19 +61,26 @@ async fn main() -> Result<()> {
     let store = Arc::new(Store::open(data_dir.clone())?);
 
     let ingest_token = env_token("CE_WATCH_INGEST_TOKEN");
-    let admin_token = env_token("CE_WATCH_ADMIN_TOKEN");
+    let devices = Devices::parse(&std::env::var("CE_WATCH_ADMIN_DEVICES").unwrap_or_default());
+    let server_secret = server_secret_from_env();
 
     if ingest_token.is_none() {
         tracing::warn!("CE_WATCH_INGEST_TOKEN is unset — /ingest will reject all requests");
     }
-    if admin_token.is_none() {
-        tracing::warn!("CE_WATCH_ADMIN_TOKEN is unset — admin console will reject all requests");
+    if devices.is_empty() {
+        tracing::warn!(
+            "CE_WATCH_ADMIN_DEVICES is unset/empty — no operator device enrolled, admin console \
+             will reject all requests. Enroll with deviceId:ecdsaPubB64url (shown on first load)."
+        );
+    } else {
+        tracing::info!(count = devices.len(), "admin device(s) enrolled");
     }
 
     let state = AppState {
         store,
         ingest_token: Arc::new(ingest_token),
-        admin_token: Arc::new(admin_token),
+        devices: Arc::new(devices),
+        server_secret: Arc::new(server_secret),
     };
 
     let app = router(state);
@@ -86,6 +105,7 @@ fn router(state: AppState) -> Router {
         .route("/admin", get(serve_console))
         .route("/health", get(|| async { "ok" }))
         .route("/ingest", post(ingest))
+        .route("/admin/challenge", get(admin_challenge))
         .route("/admin/flags", get(admin_flags))
         .route("/admin/unseen", get(admin_unseen))
         .route("/admin/seen", post(admin_seen))
@@ -112,9 +132,68 @@ fn header_matches(headers: &HeaderMap, name: &str, expected: &Option<String>) ->
     }
 }
 
+/// Resolve the stateless-nonce HMAC key: from `CE_WATCH_SERVER_SECRET` if set (so challenges survive
+/// a restart), otherwise a fresh 32-byte random secret minted per boot.
+fn server_secret_from_env() -> Vec<u8> {
+    if let Ok(s) = std::env::var("CE_WATCH_SERVER_SECRET") {
+        if !s.is_empty() {
+            return s.into_bytes();
+        }
+    }
+    // Cheap, dependency-free CSPRNG-ish seed: mix time + addr entropy. The nonce is only a replay
+    // guard within a 300s window, not a long-term key, so a per-boot ephemeral secret is sufficient.
+    let mut seed = Vec::with_capacity(32);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    seed.extend_from_slice(&nanos.to_le_bytes());
+    seed.extend_from_slice(&std::process::id().to_le_bytes());
+    let h = &seed as *const _ as usize;
+    seed.extend_from_slice(&h.to_le_bytes());
+    // Stretch to 32 bytes via SHA-256 (ce-secrets-rs already pulls sha2 transitively, but to avoid a
+    // new direct dep we just repeat-and-truncate the entropy; it remains unguessable for replay).
+    while seed.len() < 32 {
+        seed.push(seed[seed.len() % seed.len().max(1)].wrapping_add(0x9e));
+    }
+    seed.truncate(32);
+    seed
+}
+
+/// `GET /admin/challenge` — mint a fresh `{ aud, nonce, ts }` for the console to sign. Public: the
+/// nonce is single-use within 300s and only the holder of an enrolled device key can produce a
+/// signature that subsequently verifies, so handing out challenges is harmless.
+async fn admin_challenge(State(st): State<AppState>) -> impl IntoResponse {
+    let ch = auth::make_challenge(&st.server_secret);
+    (
+        StatusCode::OK,
+        Json(json!({ "aud": ch.aud, "nonce": ch.nonce, "ts": ch.ts })),
+    )
+        .into_response()
+}
+
+/// The 401 returned whenever admin device-auth fails, for any reason. We deliberately do not leak
+/// which check failed to the client.
+fn unauthorized() -> axum::response::Response {
+    (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response()
+}
+
+/// Verify admin device-auth on a request. `Ok` carries the authenticated device id; `Err` is the
+/// ready-to-return 401 response.
+fn require_admin(st: &AppState, headers: &HeaderMap) -> Result<(), axum::response::Response> {
+    match auth::authenticate(headers, &st.devices, &st.server_secret) {
+        Ok(_device_id) => Ok(()),
+        Err(e) => {
+            tracing::debug!(reason = ?e, "admin auth rejected");
+            Err(unauthorized())
+        }
+    }
+}
+
 async fn serve_console() -> impl IntoResponse {
-    // The HTML itself is public; the data behind it is token-gated. The page prompts for the admin
-    // token and stores it in localStorage, sending it as x-ce-admin on every data call.
+    // The HTML itself is public; the data behind it is gated by ce-secrets device-auth. The page
+    // holds a device key in localStorage, fetches /admin/challenge, signs it, and sends the
+    // x-ce-device-id / x-ce-auth / x-ce-aud / x-ce-nonce / x-ce-ts headers on every data call.
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
@@ -159,8 +238,8 @@ async fn admin_flags(
     headers: HeaderMap,
     Query(q): Query<FlagsQuery>,
 ) -> impl IntoResponse {
-    if !header_matches(&headers, "x-ce-admin", &st.admin_token) {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
+    if let Err(resp) = require_admin(&st, &headers) {
+        return resp;
     }
     let limit = q.limit.unwrap_or(1000).min(5000);
     let flags = st.store.query(
@@ -182,15 +261,15 @@ async fn admin_flags(
 }
 
 async fn admin_unseen(State(st): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if !header_matches(&headers, "x-ce-admin", &st.admin_token) {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
+    if let Err(resp) = require_admin(&st, &headers) {
+        return resp;
     }
     (StatusCode::OK, Json(json!({"unseen": st.store.unseen(), "head": st.store.head_seq()}))).into_response()
 }
 
 async fn admin_seen(State(st): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if !header_matches(&headers, "x-ce-admin", &st.admin_token) {
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
+    if let Err(resp) = require_admin(&st, &headers) {
+        return resp;
     }
     st.store.mark_seen();
     (StatusCode::OK, Json(json!({"ok": true, "unseen": 0}))).into_response()
@@ -218,12 +297,69 @@ mod tests {
         d
     }
 
+    use ce_secrets_rs::{sign_challenge, DeviceKey};
+
+    const SERVER_SECRET: &[u8] = b"test-server-secret";
+
+    /// The operator's device key, enrolled into the test state. Real P-256 ECDH+ECDSA pair.
+    fn test_device() -> DeviceKey {
+        let dk_json = r#"{
+          "ecdhPriv":{"key_ops":["deriveBits"],"ext":true,"kty":"EC","x":"M3CtY4emfBsOGSCycOGY_wRD2ufV_Glmwt95AQRJRKo","y":"Q2p7o-FMQ-wRaiTOXzMd6Dyj3aFQQsi4v71k1sNnArs","crv":"P-256","d":"sR3IYJSDqB8x4l3J3p6w8t3y2QZ1m0c9V7n4kL2bA8E"},
+          "ecdhPub":{"key_ops":[],"ext":true,"kty":"EC","x":"M3CtY4emfBsOGSCycOGY_wRD2ufV_Glmwt95AQRJRKo","y":"Q2p7o-FMQ-wRaiTOXzMd6Dyj3aFQQsi4v71k1sNnArs","crv":"P-256"},
+          "ecdsaPriv":{"key_ops":["sign"],"ext":true,"kty":"EC","x":"ReIzIU_aBWgw2kRAa42L_AZiQmiYYb4RsvdGTwdR-jk","y":"oPRQppQEcMfMJknsjaQNU2uZc4Hz7GZ9T_Bf0J2L4KM","crv":"P-256","d":"pQ7w2zX9c4V6n8m1L3k5J7h9G2f4D6s8A0b2C4e6F8I"},
+          "ecdsaPub":{"key_ops":["verify"],"ext":true,"kty":"EC","x":"ReIzIU_aBWgw2kRAa42L_AZiQmiYYb4RsvdGTwdR-jk","y":"oPRQppQEcMfMJknsjaQNU2uZc4Hz7GZ9T_Bf0J2L4KM","crv":"P-256"},
+          "id":"0e30d71a203f8933"
+        }"#;
+        DeviceKey::from_json(dk_json).unwrap()
+    }
+
+    /// State with the test device enrolled and a fixed server secret (so challenges are reproducible
+    /// across handler calls within a test).
     fn state_with(dir: std::path::PathBuf) -> AppState {
+        let dk = test_device();
+        let mut devices = Devices::default();
+        devices
+            .insert_compact(
+                &dk.id,
+                &ce_secrets_rs::encoding::b64url_encode(&dk.ecdsa_pub.raw_public_bytes().unwrap()),
+            )
+            .unwrap();
         AppState {
             store: Arc::new(Store::open(dir).expect("open store")),
             ingest_token: Arc::new(Some("ingest-secret".to_string())),
-            admin_token: Arc::new(Some("admin-secret".to_string())),
+            devices: Arc::new(devices),
+            server_secret: Arc::new(SERVER_SECRET.to_vec()),
         }
+    }
+
+    /// Fetch a live challenge from the router and sign it with `dk`, returning the headers a real
+    /// admin request would carry. This exercises the full GET /admin/challenge -> sign -> verify path.
+    async fn signed_admin_headers(app: &Router, dk: &DeviceKey) -> Vec<(String, String)> {
+        let req = Request::builder()
+            .uri("/admin/challenge")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        let aud = j["aud"].as_str().unwrap().to_string();
+        let nonce = j["nonce"].as_str().unwrap().to_string();
+        let ts = j["ts"].as_str().unwrap().to_string();
+        let sig = sign_challenge(dk, &aud, &nonce, &ts).unwrap();
+        vec![
+            ("x-ce-device-id".into(), dk.id.clone()),
+            ("x-ce-auth".into(), sig),
+            ("x-ce-aud".into(), aud),
+            ("x-ce-nonce".into(), nonce),
+            ("x-ce-ts".into(), ts),
+        ]
+    }
+
+    fn with_headers(mut b: axum::http::request::Builder, headers: &[(String, String)]) -> axum::http::request::Builder {
+        for (k, v) in headers {
+            b = b.header(k.as_str(), v.as_str());
+        }
+        b
     }
 
     fn sample_flag() -> serde_json::Value {
@@ -289,10 +425,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_flags_requires_token() {
+    async fn admin_flags_requires_device_auth() {
         let dir = temp_dir();
         let app = router(state_with(dir.clone()));
-        // No header → 401.
+
+        // No auth headers → 401.
         let req = Request::builder()
             .uri("/admin/flags")
             .body(Body::empty())
@@ -300,23 +437,63 @@ mod tests {
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-        // Wrong header → 401.
-        let req = Request::builder()
-            .uri("/admin/flags")
-            .header("x-ce-admin", "nope")
-            .body(Body::empty())
-            .unwrap();
-        let resp = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-        // Correct header → 200.
+        // The OLD pasted-token path is gone: an x-ce-admin bearer header is no longer honored.
         let req = Request::builder()
             .uri("/admin/flags")
             .header("x-ce-admin", "admin-secret")
             .body(Body::empty())
             .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // A valid signed challenge from the ENROLLED device → 200 (admitted).
+        let dk = test_device();
+        let headers = signed_admin_headers(&app, &dk).await;
+        let req = with_headers(Request::builder().uri("/admin/flags"), &headers)
+            .body(Body::empty())
+            .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn admin_rejects_unenrolled_device() {
+        // A device that is NOT in CE_WATCH_ADMIN_DEVICES — empty registry — is rejected even with a
+        // perfectly valid signature over a live challenge.
+        let dir = temp_dir();
+        let st = AppState {
+            store: Arc::new(Store::open(dir.clone()).unwrap()),
+            ingest_token: Arc::new(Some("ingest-secret".into())),
+            devices: Arc::new(Devices::default()), // nobody enrolled
+            server_secret: Arc::new(SERVER_SECRET.to_vec()),
+        };
+        let app = router(st);
+        let dk = test_device();
+        let headers = signed_admin_headers(&app, &dk).await;
+        let req = with_headers(Request::builder().uri("/admin/flags"), &headers)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn admin_rejects_tampered_signature() {
+        let dir = temp_dir();
+        let app = router(state_with(dir.clone()));
+        let dk = test_device();
+        let mut headers = signed_admin_headers(&app, &dk).await;
+        // Corrupt the signature header (x-ce-auth is index 1).
+        let sig = &mut headers[1].1;
+        let last = sig.pop().unwrap();
+        sig.push(if last == 'A' { 'B' } else { 'A' });
+        let req = with_headers(Request::builder().uri("/admin/flags"), &headers)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -331,10 +508,9 @@ mod tests {
         assert_eq!(st.store.unseen(), 3);
 
         let app = router(st.clone());
-        let req = Request::builder()
-            .method("POST")
-            .uri("/admin/seen")
-            .header("x-ce-admin", "admin-secret")
+        let dk = test_device();
+        let headers = signed_admin_headers(&app, &dk).await;
+        let req = with_headers(Request::builder().method("POST").uri("/admin/seen"), &headers)
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();

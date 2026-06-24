@@ -106,21 +106,90 @@
     color: var(--accent); border: 1px solid rgba(43,212,168,0.35); }
   .sample { color: var(--ink-dim); font-size: 11px; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .empty { color: var(--ink-dim); text-align: center; padding: 60px; }
-  .gate { max-width: 420px; margin: 16vh auto; padding: 28px; border: 1px solid var(--line);
+  .gate { max-width: 520px; margin: 12vh auto; padding: 28px; border: 1px solid var(--line);
     border-radius: 10px; background: var(--panel); }
   .gate h1 { font-size: 15px; letter-spacing: 2px; color: #fff; }
   .gate p { color: var(--ink-dim); line-height: 1.6; }
   .gate input { width: 100%; margin: 12px 0; padding: 10px; }
   .err { color: var(--red); min-height: 16px; }
+  .enroll { margin-top: 18px; padding: 14px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--panel-2); }
+  .enroll .lbl { color: var(--ink-dim); text-transform: uppercase; font-size: 10px; letter-spacing: 1px; }
+  .enroll code { display: block; margin: 6px 0 14px; padding: 8px 10px; border-radius: 6px;
+    background: #060810; color: var(--accent); word-break: break-all; border: 1px solid var(--line); }
+  .enroll code.copy { cursor: pointer; }
+  .enroll code.copy:hover { border-color: var(--accent); }
 </style>
 </head>
 <body>
 <div id="app"></div>
 <script>
-const LS_KEY = "ce-watch-admin-token";
-let token = localStorage.getItem(LS_KEY) || "";
+// ce-watch admin auth — ce-secrets challenge-response, inlined WebCrypto (byte-exact with the
+// canonical crypto.mjs / auth.mjs and the Rust SDK). The operator's device key lives in
+// localStorage; on first load we show the deviceId + compact public key so they can enroll it ONCE
+// into CE_WATCH_ADMIN_DEVICES at deploy. No token prompt, ever.
+const LS_DEVICE = "ce-watch-device-key";
+const AUD = "ce-watch";
+const subtle = globalThis.crypto.subtle;
+let device = null;   // { ecdhPriv, ecdhPub, ecdsaPriv, ecdsaPub, id }
 let lastHead = 0;
 let rows = [];
+
+// ---- encoding (mirror crypto.mjs b64/hex exactly) ----
+const b64u = {
+  enc(buf) { const b = buf instanceof Uint8Array ? buf : new Uint8Array(buf); let s = "";
+    for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); },
+  dec(str) { const s = str.replace(/-/g, "+").replace(/_/g, "/");
+    const bin = atob(s + "===".slice((s.length + 3) % 4));
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i); return out; },
+};
+const hexenc = (buf) => [...(buf instanceof Uint8Array ? buf : new Uint8Array(buf))]
+  .map((x) => x.toString(16).padStart(2, "0")).join("");
+const utf8 = (s) => new TextEncoder().encode(s);
+// trap #5: top-level keys sorted, no whitespace — identical bytes to the Rust verifier.
+const stableStringify = (o) => JSON.stringify(o, Object.keys(o).sort());
+
+// ---- device key: ECDH + ECDSA P-256, JWK-serialized, deviceId = hex(sha256([x,y,x,y]))[..16] ----
+async function deviceIdOf(ecdhPub, ecdsaPub) {
+  const data = utf8(JSON.stringify([ecdhPub.x, ecdhPub.y, ecdsaPub.x, ecdsaPub.y]));
+  return hexenc(new Uint8Array(await subtle.digest("SHA-256", data))).slice(0, 16);
+}
+async function generateDevice() {
+  const ecdh = await subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+  const ecdsa = await subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+  const dk = {
+    ecdhPriv: await subtle.exportKey("jwk", ecdh.privateKey),
+    ecdhPub: await subtle.exportKey("jwk", ecdh.publicKey),
+    ecdsaPriv: await subtle.exportKey("jwk", ecdsa.privateKey),
+    ecdsaPub: await subtle.exportKey("jwk", ecdsa.publicKey),
+  };
+  dk.id = await deviceIdOf(dk.ecdhPub, dk.ecdsaPub);
+  return dk;
+}
+async function loadOrCreateDevice() {
+  const saved = localStorage.getItem(LS_DEVICE);
+  if (saved) { try { return JSON.parse(saved); } catch (e) {} }
+  const dk = await generateDevice();
+  localStorage.setItem(LS_DEVICE, JSON.stringify(dk));
+  return dk;
+}
+// The compact deploy string the operator enrolls: b64url(04 || ecdsaPub.x || ecdsaPub.y).
+function compactPub(dk) {
+  const x = b64u.dec(dk.ecdsaPub.x), y = b64u.dec(dk.ecdsaPub.y);
+  const raw = new Uint8Array(65); raw[0] = 0x04; raw.set(x, 1); raw.set(y, 33);
+  return b64u.enc(raw);
+}
+// Sign the flat canonical body { aud, deviceId, nonce, ts } -> base64url(raw P1363 64-byte sig).
+async function signChallenge(dk, aud, nonce, ts) {
+  const priv = await subtle.importKey("jwk", dk.ecdsaPriv, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+  const body = { aud: String(aud), deviceId: String(dk.id), nonce: String(nonce), ts: String(ts) };
+  const data = utf8(stableStringify(body));
+  // WebCrypto ECDSA emits raw IEEE-P1363 r||s (trap #3) — exactly what the Rust SDK expects.
+  const sig = new Uint8Array(await subtle.sign({ name: "ECDSA", hash: "SHA-256" }, priv, data));
+  return b64u.enc(sig); // base64url no-pad (trap #4)
+}
 
 function h(tag, attrs, kids) {
   const e = document.createElement(tag);
@@ -134,29 +203,55 @@ function h(tag, attrs, kids) {
   return e;
 }
 
+// The "not yet enrolled / locked" screen. Shows the operator THIS device's id + public key so they
+// paste it once into CE_WATCH_ADMIN_DEVICES at deploy. No token entry — possession of the device key
+// (held in localStorage) is the credential.
 function gate(msg) {
   const app = document.getElementById("app");
   app.innerHTML = "";
-  const inp = h("input", { type: "password", placeholder: "admin token", autofocus: "true" });
-  const err = h("div", { class: "err" }, [msg || ""]);
-  const submit = () => {
-    token = inp.value.trim();
-    localStorage.setItem(LS_KEY, token);
-    boot();
-  };
-  inp.addEventListener("keydown", e => { if (e.key === "Enter") submit(); });
+  const id = device ? device.id : "(generating…)";
+  const pub = device ? compactPub(device) : "";
+  const entry = device ? id + ":" + pub : "";
+  const idCode = h("code", {}, [id]);
+  const entryCode = h("code", { class: "copy", title: "click to copy" }, [entry]);
+  entryCode.addEventListener("click", () => {
+    navigator.clipboard && navigator.clipboard.writeText(entry);
+    entryCode.textContent = "copied — paste into CE_WATCH_ADMIN_DEVICES";
+    setTimeout(() => { entryCode.textContent = entry; }, 1400);
+  });
   app.append(h("div", { class: "gate" }, [
     h("h1", {}, ["ce-watch // restricted"]),
-    h("p", {}, ["Operator security console. Provide the admin token to view the flag log."]),
-    inp, err,
-    h("button", { onclick: submit }, ["unlock"]),
+    h("p", {}, [
+      "This browser holds a device key. To grant it access, enroll its public key ONCE in the ",
+      "server's ", h("code", {}, ["CE_WATCH_ADMIN_DEVICES"]), " env (comma-separated), then redeploy. ",
+      "After that, this device signs every request — no token to paste.",
+    ]),
+    h("div", { class: "err" }, [msg || ""]),
+    h("div", { class: "enroll" }, [
+      h("div", { class: "lbl" }, ["this device id"]),
+      idCode,
+      h("div", { class: "lbl" }, ["enroll line (deviceId:pub) — click to copy"]),
+      entryCode,
+    ]),
+    h("button", { onclick: boot }, ["retry"]),
   ]));
-  inp.focus();
 }
 
+// Attach a freshly signed challenge to a request. Fetches /admin/challenge, signs it with the device
+// key, and sets the x-ce-device-id / x-ce-auth / x-ce-aud / x-ce-nonce / x-ce-ts headers.
 async function api(path, opts) {
   opts = opts || {};
-  opts.headers = Object.assign({}, opts.headers, { "x-ce-admin": token });
+  const cr = await fetch("/admin/challenge");
+  if (!cr.ok) throw new Error("challenge failed");
+  const ch = await cr.json();
+  const sig = await signChallenge(device, ch.aud, ch.nonce, ch.ts);
+  opts.headers = Object.assign({}, opts.headers, {
+    "x-ce-device-id": device.id,
+    "x-ce-auth": sig,
+    "x-ce-aud": ch.aud,
+    "x-ce-nonce": ch.nonce,
+    "x-ce-ts": ch.ts,
+  });
   return fetch(path, opts);
 }
 
@@ -178,7 +273,7 @@ function renderShell() {
         h("span", { id: "unseen-label", class: "ip" }, ["0 unseen"]),
       ]),
       h("button", { class: "danger", onclick: markSeen }, ["mark seen"]),
-      h("button", { onclick: () => { localStorage.removeItem(LS_KEY); token=""; gate("locked"); } }, ["lock"]),
+      h("button", { onclick: () => gate("") }, ["device"]),
     ]),
     h("div", { class: "bar" }, [
       h("label", {}, ["heuristic"]),
@@ -248,7 +343,7 @@ async function refresh(replace) {
   let r;
   try { r = await api("/admin/flags?" + qs.toString()); }
   catch (e) { return; }
-  if (r.status === 401) { gate("invalid token"); return; }
+  if (r.status === 401) { gate("this device is not enrolled (or the server has no operator yet)"); return; }
   if (!r.ok) return;
   const j = await r.json();
 
@@ -297,8 +392,15 @@ function where(f) {
   return s.endpoint || s.func || s.chosen_node || s.target || "—";
 }
 
-function boot() {
-  if (!token) { gate(); return; }
+async function boot() {
+  if (!device) device = await loadOrCreateDevice();
+  // Probe enrollment with a real signed request. If we are not enrolled yet, show the gate with this
+  // device's id + public key so the operator can add it to CE_WATCH_ADMIN_DEVICES.
+  let probe;
+  try { probe = await api("/admin/unseen"); }
+  catch (e) { gate("could not reach the server"); return; }
+  if (probe.status === 401) { gate(""); return; }
+  if (!probe.ok) { gate("server error"); return; }
   renderShell();
   refresh(true);
   if (window._ceTimer) clearInterval(window._ceTimer);
