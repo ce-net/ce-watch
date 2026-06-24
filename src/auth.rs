@@ -1,22 +1,21 @@
 //! Device-auth for the admin console — ce-secrets challenge-response, no pasted bearer token.
 //!
-//! The operator enrolls their device's ECDSA public key ONCE at deploy (via the
-//! `CE_WATCH_ADMIN_DEVICES` env), not on every visit. Thereafter the console proves possession of
-//! the matching private key per request:
+//! A device proves possession of its ECDSA private key per request:
 //!
 //!   1. `GET /admin/challenge` -> `{ aud: "ce-watch", nonce, ts }`. The nonce is the stateless
 //!      `HMAC-SHA256(server_secret, ts)` from the ce-secrets auth primitive; nothing is stored.
 //!   2. The console signs the flat canonical body `{ aud, deviceId, nonce, ts }` with its device
 //!      ECDSA key (raw-P1363, base64url, no-pad) and sends `x-ce-device-id`, `x-ce-auth` (the sig),
 //!      plus the challenge fields `x-ce-aud` / `x-ce-nonce` / `x-ce-ts`.
-//!   3. We re-derive + TTL-check the nonce, confirm the device id is enrolled, and verify the
-//!      signature against that device's enrolled ECDSA public key via `ce_secrets::verify_auth`.
+//!   3. We re-derive + TTL-check the nonce, then verify the signature against the device's ECDSA
+//!      public key via `ce_secrets::verify_auth` ([`authenticate_with_pub`]).
 //!
-//! This is the whole login: "enrolled here" == "is the operator." All five ce-secrets interop traps
-//! (HKDF empty salt, AES-GCM 12-byte nonce, raw-P1363-not-DER, base64url-no-pad, top-level-sorted
-//! canonical JSON) are honored by the SDK we call.
-
-use std::collections::HashMap;
+//! "Key-valid" (the signature verifies for the claimed deviceId) is distinct from "is-admin" (that
+//! deviceId has `role=admin` in the persisted admin store, see `store::AdminStore`). The store, not
+//! a static env registry, is the source of truth for membership: enrollment is self-service
+//! (claim / request / approve / revoke). The env `CE_WATCH_ADMIN_DEVICES` is only a one-time
+//! bootstrap seed. All five ce-secrets interop traps (HKDF empty salt, AES-GCM 12-byte nonce,
+//! raw-P1363-not-DER, base64url-no-pad, top-level-sorted canonical JSON) are honored by the SDK.
 
 use axum::http::HeaderMap;
 use ce_secrets_rs::device::Jwk;
@@ -26,64 +25,32 @@ use ce_secrets_rs::{check_nonce, make_nonce, now_unix_ms, verify_auth, AUTH_TTL_
 /// The audience this console binds challenges to. A signature for a different `aud` will not verify.
 pub const AUD: &str = "ce-watch";
 
-/// The registry of enrolled operator devices: `deviceId -> enrolled ECDSA public JWK`.
-///
-/// Built once at boot from `CE_WATCH_ADMIN_DEVICES`. An empty registry means no device can
-/// authenticate (admin endpoints reject everything), which is the safe default for a security
-/// console with no operator enrolled yet.
-#[derive(Clone, Default)]
-pub struct Devices {
-    by_id: HashMap<String, Jwk>,
-}
-
-impl Devices {
-    pub fn is_empty(&self) -> bool {
-        self.by_id.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.by_id.len()
-    }
-
-    /// Look up the enrolled ECDSA public key for a device id.
-    pub fn get(&self, device_id: &str) -> Option<&Jwk> {
-        self.by_id.get(device_id)
-    }
-
-    /// Enroll one device from its id and compact public form. Used by the parser and by tests.
-    pub fn insert_compact(&mut self, device_id: &str, ecdsa_pub_b64url: &str) -> anyhow::Result<()> {
-        let jwk = ecdsa_pub_from_compact(ecdsa_pub_b64url)?;
-        self.by_id.insert(device_id.to_string(), jwk);
-        Ok(())
-    }
-
-    /// Parse the `CE_WATCH_ADMIN_DEVICES` env value: comma-separated `deviceId:ecdsaPubB64url`
-    /// entries, where `ecdsaPubB64url` is base64url(no-pad) of the 65-byte uncompressed SEC1 point
-    /// (`04 || x || y`). Whitespace and empty entries are ignored. A malformed entry is skipped with
-    /// a warning rather than failing boot, so one bad paste cannot lock out a valid co-enrolled
-    /// device.
-    pub fn parse(env: &str) -> Self {
-        let mut devices = Devices::default();
-        for entry in env.split(',') {
-            let entry = entry.trim();
-            if entry.is_empty() {
-                continue;
-            }
-            // deviceId is 16 hex chars; the pub may itself contain no ':', so split once on the
-            // FIRST colon.
-            let Some((id, pub_b64)) = entry.split_once(':') else {
-                tracing::warn!(entry, "CE_WATCH_ADMIN_DEVICES entry missing ':' — skipped");
-                continue;
-            };
-            let id = id.trim();
-            let pub_b64 = pub_b64.trim();
-            match devices.insert_compact(id, pub_b64) {
-                Ok(()) => tracing::info!(device_id = id, "enrolled admin device"),
-                Err(e) => tracing::warn!(device_id = id, error = %e, "bad admin device pub — skipped"),
-            }
+/// Parse the `CE_WATCH_ADMIN_DEVICES` env value into `(deviceId, compactPub)` seed pairs for the
+/// persisted admin store. Wire format: comma-separated `deviceId:ecdsaPubB64url`, where the pub is
+/// base64url(no-pad) of the 65-byte uncompressed SEC1 point (`04 || x || y`). We validate the pub is
+/// a well-formed SEC1 point and
+/// keep the original compact string (so the store persists the exact bytes the console derives). A
+/// malformed entry is skipped with a warning rather than failing boot.
+pub fn parse_seed(env: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for entry in env.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
         }
-        devices
+        let Some((id, pub_b64)) = entry.split_once(':') else {
+            tracing::warn!(entry, "CE_WATCH_ADMIN_DEVICES entry missing ':' — skipped");
+            continue;
+        };
+        let id = id.trim().to_string();
+        let pub_b64 = pub_b64.trim().to_string();
+        // Validate it reconstructs to a P-256 point; keep the original compact string regardless.
+        match ecdsa_pub_from_compact(&pub_b64) {
+            Ok(_) => out.push((id, pub_b64)),
+            Err(e) => tracing::warn!(device_id = %id, error = %e, "bad seed admin pub — skipped"),
+        }
     }
+    out
 }
 
 /// Reconstruct an ECDSA P-256 public JWK from the compact wire form: base64url(no-pad) of the
@@ -132,37 +99,67 @@ pub enum AuthError {
     MissingHeaders,
     AudMismatch,
     BadOrExpiredNonce,
-    NotEnrolled,
     BadSignature,
 }
 
-/// Full relying-party check, mirroring `verifyAuthFull` in `auth.mjs`:
-/// audience binding, nonce re-derivation + TTL, enrollment lookup, then the pure signature verify.
-/// Returns the authenticated device id on success.
-pub fn authenticate<'a>(
+/// The "key-valid" check used by the self-service store: prove possession of the ECDSA private key
+/// matching `pub_b64` (the compact SEC1 form) over a fresh challenge. The caller resolves `pub_b64`
+/// either from the persisted admin store (for known devices) or from the request body (TOFU, for a
+/// first `claim`/`request`). Returns the authenticated device id.
+///
+/// "Key-valid" is distinct from "is-admin": this proves the device controls the key for the claimed
+/// `deviceId`; the store decides whether that device has `role=admin`.
+pub fn authenticate_with_pub<'a>(
     headers: &'a HeaderMap,
-    devices: &Devices,
+    pub_b64: &str,
     server_secret: &[u8],
 ) -> Result<&'a str, AuthError> {
+    let (device_id, sig, aud, nonce, ts) = challenge_fields(headers)?;
+    verify_challenge(server_secret, aud, nonce, ts)?;
+    let jwk = ecdsa_pub_from_compact(pub_b64).map_err(|_| AuthError::BadSignature)?;
+    match verify_auth(&jwk, aud, device_id, nonce, ts, sig) {
+        Ok(true) => Ok(device_id),
+        _ => Err(AuthError::BadSignature),
+    }
+}
+
+/// Extract the five challenge headers, or `MissingHeaders`.
+fn challenge_fields<'a>(
+    headers: &'a HeaderMap,
+) -> Result<(&'a str, &'a str, &'a str, &'a str, &'a str), AuthError> {
     let device_id = header(headers, "x-ce-device-id").ok_or(AuthError::MissingHeaders)?;
     let sig = header(headers, "x-ce-auth").ok_or(AuthError::MissingHeaders)?;
     let aud = header(headers, "x-ce-aud").ok_or(AuthError::MissingHeaders)?;
     let nonce = header(headers, "x-ce-nonce").ok_or(AuthError::MissingHeaders)?;
     let ts = header(headers, "x-ce-ts").ok_or(AuthError::MissingHeaders)?;
+    Ok((device_id, sig, aud, nonce, ts))
+}
 
+/// Audience binding + nonce re-derivation + 300s TTL. Stateless: no server-side nonce store.
+fn verify_challenge(
+    server_secret: &[u8],
+    aud: &str,
+    nonce: &str,
+    ts: &str,
+) -> Result<(), AuthError> {
     if aud != AUD {
         return Err(AuthError::AudMismatch);
     }
-    // Re-derive the nonce from our own secret + the supplied ts, and enforce the 300s TTL. A
-    // tampered or replayed-after-expiry challenge fails here without any server-side nonce store.
     if !check_nonce(server_secret, ts, nonce, now_unix_ms(), AUTH_TTL_SECS) {
         return Err(AuthError::BadOrExpiredNonce);
     }
-    let enrolled = devices.get(device_id).ok_or(AuthError::NotEnrolled)?;
-    match verify_auth(enrolled, aud, device_id, nonce, ts, sig) {
-        Ok(true) => Ok(device_id),
-        _ => Err(AuthError::BadSignature),
-    }
+    Ok(())
+}
+
+/// The claimed device id from the `x-ce-device-id` header (unverified — only proves which key the
+/// caller asks us to check against; the signature check is what actually authenticates).
+pub fn header_device_id(headers: &HeaderMap) -> Option<&str> {
+    header(headers, "x-ce-device-id")
+}
+
+/// Validate a compact ECDSA SEC1 pub string (used to vet request bodies before persisting).
+pub fn validate_compact_pub(b64url: &str) -> anyhow::Result<()> {
+    ecdsa_pub_from_compact(b64url).map(|_| ())
 }
 
 fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -248,39 +245,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_env_enrolls_devices() {
+    fn parse_seed_yields_id_pub_pairs() {
         let dk = test_device();
-        let env = format!("{}:{}", dk.id, compact_pub(&dk));
-        let devices = Devices::parse(&env);
-        assert_eq!(devices.len(), 1);
-        assert!(devices.get(&dk.id).is_some());
+        let env = format!("  {}:{} , , bad-entry-no-colon ", dk.id, compact_pub(&dk));
+        let seed = parse_seed(&env);
+        // The valid entry is kept; the empty + colon-less entries are skipped.
+        assert_eq!(seed.len(), 1);
+        assert_eq!(seed[0].0, dk.id);
+        assert_eq!(seed[0].1, compact_pub(&dk));
     }
 
     #[test]
-    fn enrolled_device_with_valid_challenge_is_admitted() {
+    fn valid_challenge_is_admitted_against_pub() {
         let dk = test_device();
         let secret = b"server-secret";
-        let mut devices = Devices::default();
-        devices.insert_compact(&dk.id, &compact_pub(&dk)).unwrap();
-
-        let ch = make_challenge(secret);
-        let sig = sign_challenge(&dk, ch.aud, &ch.nonce, &ch.ts).unwrap();
-        let headers = header_map(&[
-            ("x-ce-device-id", &dk.id),
-            ("x-ce-auth", &sig),
-            ("x-ce-aud", ch.aud),
-            ("x-ce-nonce", &ch.nonce),
-            ("x-ce-ts", &ch.ts),
-        ]);
-        assert_eq!(authenticate(&headers, &devices, secret), Ok(dk.id.as_str()));
-    }
-
-    #[test]
-    fn unenrolled_device_is_rejected() {
-        let dk = test_device();
-        let secret = b"server-secret";
-        // Empty registry — this device is not enrolled.
-        let devices = Devices::default();
         let ch = make_challenge(secret);
         let sig = sign_challenge(&dk, ch.aud, &ch.nonce, &ch.ts).unwrap();
         let headers = header_map(&[
@@ -291,8 +269,31 @@ mod tests {
             ("x-ce-ts", &ch.ts),
         ]);
         assert_eq!(
-            authenticate(&headers, &devices, secret),
-            Err(AuthError::NotEnrolled)
+            authenticate_with_pub(&headers, &compact_pub(&dk), secret),
+            Ok(dk.id.as_str())
+        );
+    }
+
+    #[test]
+    fn wrong_pub_is_rejected() {
+        // A valid signature, but verified against a DIFFERENT device's pub -> BadSignature. (This is
+        // the "key-valid" failure: you do not control the key for that pub.)
+        let dk = test_device();
+        let secret = b"server-secret";
+        // A different, valid P-256 SEC1 point.
+        let other_pub = "BF5pM_MXcWTd_QhLuLeN-0Uz_c6kqXjfxxD1hZflnL4nWHvWLOzDWyZmUhG8nnISc8dN5Gol-Cyfm1YaJpIvUWU";
+        let ch = make_challenge(secret);
+        let sig = sign_challenge(&dk, ch.aud, &ch.nonce, &ch.ts).unwrap();
+        let headers = header_map(&[
+            ("x-ce-device-id", &dk.id),
+            ("x-ce-auth", &sig),
+            ("x-ce-aud", ch.aud),
+            ("x-ce-nonce", &ch.nonce),
+            ("x-ce-ts", &ch.ts),
+        ]);
+        assert_eq!(
+            authenticate_with_pub(&headers, other_pub, secret),
+            Err(AuthError::BadSignature)
         );
     }
 
@@ -300,9 +301,6 @@ mod tests {
     fn tampered_signature_is_rejected() {
         let dk = test_device();
         let secret = b"server-secret";
-        let mut devices = Devices::default();
-        devices.insert_compact(&dk.id, &compact_pub(&dk)).unwrap();
-
         let ch = make_challenge(secret);
         let mut sig = sign_challenge(&dk, ch.aud, &ch.nonce, &ch.ts).unwrap();
         // Flip a character in the base64url signature.
@@ -316,7 +314,7 @@ mod tests {
             ("x-ce-ts", &ch.ts),
         ]);
         assert_eq!(
-            authenticate(&headers, &devices, secret),
+            authenticate_with_pub(&headers, &compact_pub(&dk), secret),
             Err(AuthError::BadSignature)
         );
     }
@@ -325,8 +323,6 @@ mod tests {
     fn expired_challenge_is_rejected() {
         let dk = test_device();
         let secret = b"server-secret";
-        let mut devices = Devices::default();
-        devices.insert_compact(&dk.id, &compact_pub(&dk)).unwrap();
 
         // A ts 10 minutes in the past — past the 300s TTL. The nonce is correctly derived for that
         // ts (so the only thing failing is freshness), and the signature is valid over it.
@@ -353,7 +349,7 @@ mod tests {
             ("x-ce-ts", &old_ts),
         ]);
         assert_eq!(
-            authenticate(&headers, &devices, secret),
+            authenticate_with_pub(&headers, &compact_pub(&dk), secret),
             Err(AuthError::BadOrExpiredNonce)
         );
     }
@@ -362,8 +358,6 @@ mod tests {
     fn tampered_nonce_is_rejected() {
         let dk = test_device();
         let secret = b"server-secret";
-        let mut devices = Devices::default();
-        devices.insert_compact(&dk.id, &compact_pub(&dk)).unwrap();
 
         let ch = make_challenge(secret);
         // Forge a nonce the server did not issue (not HMAC(secret, ts)).
@@ -377,17 +371,17 @@ mod tests {
             ("x-ce-ts", &ch.ts),
         ]);
         assert_eq!(
-            authenticate(&headers, &devices, secret),
+            authenticate_with_pub(&headers, &compact_pub(&dk), secret),
             Err(AuthError::BadOrExpiredNonce)
         );
     }
 
     #[test]
     fn missing_headers_rejected() {
-        let devices = Devices::default();
+        let dk = test_device();
         let headers = header_map(&[]);
         assert_eq!(
-            authenticate(&headers, &devices, b"s"),
+            authenticate_with_pub(&headers, &compact_pub(&dk), b"s"),
             Err(AuthError::MissingHeaders)
         );
     }

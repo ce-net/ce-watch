@@ -6,7 +6,7 @@
 //! `MAX_LOG_BYTES` it is moved aside to `flags.jsonl.1` (one generation kept) and a fresh file is
 //! started, so disk usage stays bounded without losing recent history.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -218,6 +218,294 @@ fn rotate(g: &mut Inner) -> Result<()> {
     g.file = file;
     g.bytes = 0;
     Ok(())
+}
+
+/// The role a device holds in the admin store. `Admin` may use the flag console and manage other
+/// devices; `Pending` is a device that has requested access but not yet been approved.
+pub const ROLE_ADMIN: &str = "admin";
+pub const ROLE_PENDING: &str = "pending";
+
+/// A persisted admin/pending device record. `pub` is the compact ECDSA SEC1 form
+/// (`base64url(04||x||y)`) the console derives from its WebCrypto key — the exact string accepted by
+/// `auth::ecdsa_pub_from_compact`, so we can reconstruct the verifying key to authenticate the
+/// device on every request.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AdminDevice {
+    /// Compact ECDSA SEC1 public point, base64url(no-pad) of `04 || x(32) || y(32)`.
+    #[serde(rename = "pub")]
+    pub pub_b64: String,
+    /// `"admin"` or `"pending"`.
+    pub role: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub added_ts: u64,
+}
+
+/// The persisted, self-managed admin device store (`admins.json` in the data dir). It is the source
+/// of truth for "who is an admin" after boot. Env-seeded devices are written in as `role=admin` at
+/// startup (a bootstrap) but never override a device already present in the file.
+///
+/// The map (`deviceId -> AdminDevice`) is held under a mutex and mirrored to disk atomically (write
+/// to a temp file, fsync, rename) with mode 0600 on unix, so a crash mid-write cannot corrupt it.
+pub struct AdminStore {
+    path: PathBuf,
+    inner: Mutex<BTreeMap<String, AdminDevice>>,
+}
+
+impl AdminStore {
+    /// Open (creating if needed) the admin store at `data_dir/admins.json`, replaying any existing
+    /// file, then seeding any `seed` entries (deviceId -> compact-pub) as `role=admin` for devices
+    /// not already present. A change from seeding is persisted immediately.
+    pub fn open(data_dir: &Path, seed: &[(String, String)]) -> Result<Self> {
+        std::fs::create_dir_all(data_dir)
+            .with_context(|| format!("create data dir {}", data_dir.display()))?;
+        let path = data_dir.join("admins.json");
+
+        let mut map: BTreeMap<String, AdminDevice> = BTreeMap::new();
+        if path.exists() {
+            let raw = std::fs::read_to_string(&path)
+                .with_context(|| format!("read {}", path.display()))?;
+            if !raw.trim().is_empty() {
+                map = serde_json::from_str(&raw)
+                    .with_context(|| format!("parse {}", path.display()))?;
+            }
+        }
+
+        let store = Self { path, inner: Mutex::new(map) };
+
+        // Seed env-provided devices as admins (bootstrap). The persisted file wins for any device
+        // already present, so re-deploying with the same env never demotes/overwrites live state.
+        let mut changed = false;
+        {
+            let mut g = store
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("admin store poisoned"))?;
+            for (id, pub_b64) in seed {
+                if !g.contains_key(id) {
+                    g.insert(
+                        id.clone(),
+                        AdminDevice {
+                            pub_b64: pub_b64.clone(),
+                            role: ROLE_ADMIN.to_string(),
+                            label: "env-seed".to_string(),
+                            added_ts: now_unix_secs(),
+                        },
+                    );
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            store.persist()?;
+        }
+        Ok(store)
+    }
+
+    /// Atomically write the current map to disk (temp file + fsync + rename), mode 0600 on unix.
+    fn persist(&self) -> Result<()> {
+        let g = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("admin store poisoned"))?;
+        let json = serde_json::to_string_pretty(&*g).context("serialize admins")?;
+        drop(g);
+
+        let tmp = self.path.with_extension("json.tmp");
+        {
+            let mut f = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)
+                .with_context(|| format!("open temp {}", tmp.display()))?;
+            f.write_all(json.as_bytes()).context("write admins temp")?;
+            f.flush().ok();
+            let _ = f.sync_all();
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        std::fs::rename(&tmp, &self.path).context("rename admins into place")?;
+        Ok(())
+    }
+
+    /// Number of devices with `role=admin`.
+    pub fn admin_count(&self) -> usize {
+        match self.inner.lock() {
+            Ok(g) => g.values().filter(|d| d.role == ROLE_ADMIN).count(),
+            Err(_) => 0,
+        }
+    }
+
+    /// True when at least one admin exists.
+    pub fn has_admins(&self) -> bool {
+        self.admin_count() > 0
+    }
+
+    /// The role of a device id: `"admin"`, `"pending"`, or `"none"` (unknown).
+    pub fn role_of(&self, device_id: &str) -> &'static str {
+        match self.inner.lock() {
+            Ok(g) => match g.get(device_id).map(|d| d.role.as_str()) {
+                Some(ROLE_ADMIN) => ROLE_ADMIN,
+                Some(ROLE_PENDING) => ROLE_PENDING,
+                _ => "none",
+            },
+            Err(_) => "none",
+        }
+    }
+
+    pub fn is_admin(&self, device_id: &str) -> bool {
+        self.role_of(device_id) == ROLE_ADMIN
+    }
+
+    /// Snapshot the device map (id -> record) for listing.
+    pub fn list(&self) -> Vec<(String, AdminDevice)> {
+        match self.inner.lock() {
+            Ok(g) => g.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// TOFU first claim: if there are ZERO admins, make `device_id` an admin (recording its `pub`).
+    /// Returns `Ok(true)` on success, `Ok(false)` if an admin already exists (caller -> 409).
+    pub fn claim(&self, device_id: &str, pub_b64: &str) -> Result<bool> {
+        {
+            let mut g = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("admin store poisoned"))?;
+            if g.values().any(|d| d.role == ROLE_ADMIN) {
+                return Ok(false);
+            }
+            g.insert(
+                device_id.to_string(),
+                AdminDevice {
+                    pub_b64: pub_b64.to_string(),
+                    role: ROLE_ADMIN.to_string(),
+                    label: "claimed".to_string(),
+                    added_ts: now_unix_secs(),
+                },
+            );
+        }
+        self.persist()?;
+        Ok(true)
+    }
+
+    /// Record a device as `role=pending` with its compact pub and optional label. Idempotent: a
+    /// device already present (admin or pending) is left as-is except a pending device may refresh
+    /// its label/pub. Returns the resulting role.
+    pub fn request(&self, device_id: &str, pub_b64: &str, label: &str) -> Result<&'static str> {
+        let role;
+        {
+            let mut g = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("admin store poisoned"))?;
+            match g.get_mut(device_id) {
+                Some(d) if d.role == ROLE_ADMIN => {
+                    role = ROLE_ADMIN;
+                }
+                Some(d) => {
+                    // already pending — refresh its advertised pub/label
+                    d.pub_b64 = pub_b64.to_string();
+                    if !label.is_empty() {
+                        d.label = label.to_string();
+                    }
+                    role = ROLE_PENDING;
+                }
+                None => {
+                    g.insert(
+                        device_id.to_string(),
+                        AdminDevice {
+                            pub_b64: pub_b64.to_string(),
+                            role: ROLE_PENDING.to_string(),
+                            label: label.to_string(),
+                            added_ts: now_unix_secs(),
+                        },
+                    );
+                    role = ROLE_PENDING;
+                }
+            }
+        }
+        self.persist()?;
+        Ok(role)
+    }
+
+    /// Promote a pending device to admin. Returns `Ok(true)` if a pending device was promoted,
+    /// `Ok(false)` if the device is unknown or already an admin.
+    pub fn approve(&self, device_id: &str) -> Result<bool> {
+        let mut promoted = false;
+        {
+            let mut g = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("admin store poisoned"))?;
+            if let Some(d) = g.get_mut(device_id) {
+                if d.role == ROLE_PENDING {
+                    d.role = ROLE_ADMIN.to_string();
+                    promoted = true;
+                }
+            }
+        }
+        if promoted {
+            self.persist()?;
+        }
+        Ok(promoted)
+    }
+
+    /// Remove a device entirely. Returns `Err` if removing it would drop the last admin (caller's
+    /// `requester` is passed so we can phrase that as "cannot revoke your own last admin"); the
+    /// guard is on the GLOBAL admin count, so the last admin cannot be removed by anyone.
+    pub fn revoke(&self, device_id: &str) -> Result<RevokeOutcome> {
+        let outcome;
+        {
+            let mut g = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("admin store poisoned"))?;
+            match g.get(device_id) {
+                None => return Ok(RevokeOutcome::NotFound),
+                Some(d) => {
+                    let is_admin = d.role == ROLE_ADMIN;
+                    let admin_count = g.values().filter(|x| x.role == ROLE_ADMIN).count();
+                    if is_admin && admin_count <= 1 {
+                        return Ok(RevokeOutcome::LastAdmin);
+                    }
+                }
+            }
+            g.remove(device_id);
+            outcome = RevokeOutcome::Removed;
+        }
+        self.persist()?;
+        Ok(outcome)
+    }
+
+    /// Look up a device's compact pub (for reconstructing its verifying key during auth).
+    pub fn pub_of(&self, device_id: &str) -> Option<String> {
+        match self.inner.lock() {
+            Ok(g) => g.get(device_id).map(|d| d.pub_b64.clone()),
+            Err(_) => None,
+        }
+    }
+}
+
+/// Outcome of a revoke attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RevokeOutcome {
+    Removed,
+    NotFound,
+    LastAdmin,
+}
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Resolve the data dir from env (`CE_WATCH_DATA_DIR`) or default to `./ce-watch-data`.

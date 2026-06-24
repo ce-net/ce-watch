@@ -31,8 +31,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tower_http::cors::CorsLayer;
 
-use auth::Devices;
-use store::{FlagEvent, Store};
+use store::{AdminStore, FlagEvent, RevokeOutcome, Store};
 
 const CONSOLE_HTML: &str = include_str!("console.html");
 
@@ -40,8 +39,9 @@ const CONSOLE_HTML: &str = include_str!("console.html");
 struct AppState {
     store: Arc<Store>,
     ingest_token: Arc<Option<String>>,
-    /// Enrolled operator devices (deviceId -> ECDSA public JWK) for challenge-response admin auth.
-    devices: Arc<Devices>,
+    /// Self-managed admin device store (deviceId -> { pub, role, label, added_ts }), persisted to
+    /// `admins.json`. The source of truth for who is an admin after boot. Env-seeded at startup.
+    admins: Arc<AdminStore>,
     /// Stateless-nonce HMAC key. Persisted across a process restart only if `CE_WATCH_SERVER_SECRET`
     /// is set; otherwise a fresh random secret is minted per boot (in-flight challenges from before a
     /// restart simply expire, which is the safe default).
@@ -61,25 +61,29 @@ async fn main() -> Result<()> {
     let store = Arc::new(Store::open(data_dir.clone())?);
 
     let ingest_token = env_token("CE_WATCH_INGEST_TOKEN");
-    let devices = Devices::parse(&std::env::var("CE_WATCH_ADMIN_DEVICES").unwrap_or_default());
+    // The env is now a BOOTSTRAP seed, not the source of truth: it is written into the persisted
+    // admin store at startup for any device not already present, after which admins are managed
+    // self-service (claim / request / approve / revoke) without ever touching the env or redeploying.
+    let seed = auth::parse_seed(&std::env::var("CE_WATCH_ADMIN_DEVICES").unwrap_or_default());
+    let admins = Arc::new(AdminStore::open(&data_dir, &seed)?);
     let server_secret = server_secret_from_env();
 
     if ingest_token.is_none() {
         tracing::warn!("CE_WATCH_INGEST_TOKEN is unset — /ingest will reject all requests");
     }
-    if devices.is_empty() {
+    if !admins.has_admins() {
         tracing::warn!(
-            "CE_WATCH_ADMIN_DEVICES is unset/empty — no operator device enrolled, admin console \
-             will reject all requests. Enroll with deviceId:ecdsaPubB64url (shown on first load)."
+            "no admin device yet — open the console and click \"Claim this console\" to become the \
+             first admin (TOFU). Or seed one via CE_WATCH_ADMIN_DEVICES (deviceId:ecdsaPubB64url)."
         );
     } else {
-        tracing::info!(count = devices.len(), "admin device(s) enrolled");
+        tracing::info!(count = admins.admin_count(), "admin device(s) present");
     }
 
     let state = AppState {
         store,
         ingest_token: Arc::new(ingest_token),
-        devices: Arc::new(devices),
+        admins,
         server_secret: Arc::new(server_secret),
     };
 
@@ -106,6 +110,12 @@ fn router(state: AppState) -> Router {
         .route("/health", get(|| async { "ok" }))
         .route("/ingest", post(ingest))
         .route("/admin/challenge", get(admin_challenge))
+        .route("/admin/me", get(admin_me))
+        .route("/admin/claim", post(admin_claim))
+        .route("/admin/request", post(admin_request))
+        .route("/admin/devices", get(admin_devices))
+        .route("/admin/devices/approve", post(admin_devices_approve))
+        .route("/admin/devices/revoke", post(admin_devices_revoke))
         .route("/admin/flags", get(admin_flags))
         .route("/admin/unseen", get(admin_unseen))
         .route("/admin/seen", post(admin_seen))
@@ -178,14 +188,213 @@ fn unauthorized() -> axum::response::Response {
     (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response()
 }
 
-/// Verify admin device-auth on a request. `Ok` carries the authenticated device id; `Err` is the
-/// ready-to-return 401 response.
-fn require_admin(st: &AppState, headers: &HeaderMap) -> Result<(), axum::response::Response> {
-    match auth::authenticate(headers, &st.devices, &st.server_secret) {
-        Ok(_device_id) => Ok(()),
+/// Prove the request controls the device key for the claimed `deviceId` ("key-valid"). The verifying
+/// key is resolved from the persisted admin store if the device is known; otherwise (a first-time
+/// device) the caller must supply it via the `body_pub` argument (TOFU for claim/request). Returns
+/// the authenticated device id on success, or the ready-to-return 401.
+fn require_key_valid(
+    st: &AppState,
+    headers: &HeaderMap,
+    body_pub: Option<&str>,
+) -> Result<String, axum::response::Response> {
+    // Prefer the persisted pub for a known device; fall back to the body-supplied pub for an
+    // unknown one. We must not let a known device be authenticated against an attacker-chosen body
+    // pub, so the stored pub always wins when present.
+    let device_id = match auth::header_device_id(headers) {
+        Some(id) => id,
+        None => return Err(unauthorized()),
+    };
+    let pub_b64 = match st.admins.pub_of(device_id).or_else(|| body_pub.map(|s| s.to_string())) {
+        Some(p) => p,
+        None => return Err(unauthorized()),
+    };
+    match auth::authenticate_with_pub(headers, &pub_b64, &st.server_secret) {
+        Ok(id) => Ok(id.to_string()),
         Err(e) => {
-            tracing::debug!(reason = ?e, "admin auth rejected");
+            tracing::debug!(reason = ?e, "device key-valid auth rejected");
             Err(unauthorized())
+        }
+    }
+}
+
+/// Require the request be both key-valid AND carry `role=admin` in the store. Used by the flag
+/// endpoints and the device-management endpoints. Returns the authenticated admin device id.
+fn require_admin(st: &AppState, headers: &HeaderMap) -> Result<String, axum::response::Response> {
+    let device_id = require_key_valid(st, headers, None)?;
+    if st.admins.is_admin(&device_id) {
+        Ok(device_id)
+    } else {
+        tracing::debug!(device_id = %device_id, "key-valid but not admin");
+        Err(unauthorized())
+    }
+}
+
+/// `GET /admin/me` — key-valid required. Reports this device's role from the store and whether any
+/// admin exists yet, so the console can pick the right screen (console / claim / request).
+async fn admin_me(State(st): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let device_id = match require_key_valid(&st, &headers, None) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    let role = st.admins.role_of(&device_id);
+    (
+        StatusCode::OK,
+        Json(json!({
+            "deviceId": device_id,
+            "role": role,
+            "hasAdmins": st.admins.has_admins(),
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+struct ClaimBody {
+    #[serde(default, rename = "pub")]
+    pub_b64: String,
+}
+
+/// `POST /admin/claim` — TOFU first-claim. If the store has ZERO admins, the (key-valid) requesting
+/// device becomes `role=admin`. If any admin already exists -> 409. The body carries the device's
+/// compact pub so we can both key-verify and persist it.
+async fn admin_claim(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ClaimBody>,
+) -> impl IntoResponse {
+    if body.pub_b64.is_empty() || auth::validate_compact_pub(&body.pub_b64).is_err() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad pub"}))).into_response();
+    }
+    let device_id = match require_key_valid(&st, &headers, Some(&body.pub_b64)) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    match st.admins.claim(&device_id, &body.pub_b64) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(json!({"ok": true, "deviceId": device_id, "role": "admin"})),
+        )
+            .into_response(),
+        Ok(false) => (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "admins already exist; ask one to approve your request"})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "claim persist failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "store"}))).into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RequestBody {
+    #[serde(default)]
+    label: String,
+    #[serde(default, rename = "pub")]
+    pub_b64: String,
+}
+
+/// `POST /admin/request` — key-valid required. Records the device as `role=pending` with its compact
+/// pub (so an admin can later approve+verify it) and an optional label. Idempotent.
+async fn admin_request(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RequestBody>,
+) -> impl IntoResponse {
+    if body.pub_b64.is_empty() || auth::validate_compact_pub(&body.pub_b64).is_err() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad pub"}))).into_response();
+    }
+    let device_id = match require_key_valid(&st, &headers, Some(&body.pub_b64)) {
+        Ok(id) => id,
+        Err(resp) => return resp,
+    };
+    match st.admins.request(&device_id, &body.pub_b64, body.label.trim()) {
+        Ok(role) => (
+            StatusCode::OK,
+            Json(json!({"ok": true, "deviceId": device_id, "role": role})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "request persist failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "store"}))).into_response()
+        }
+    }
+}
+
+/// `GET /admin/devices` — ADMIN ONLY. Lists admins and pending devices.
+async fn admin_devices(State(st): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err(resp) = require_admin(&st, &headers) {
+        return resp;
+    }
+    let mut admins = Vec::new();
+    let mut pending = Vec::new();
+    for (id, dev) in st.admins.list() {
+        let row = json!({ "deviceId": id, "label": dev.label, "added_ts": dev.added_ts });
+        if dev.role == store::ROLE_ADMIN {
+            admins.push(row);
+        } else {
+            pending.push(row);
+        }
+    }
+    (StatusCode::OK, Json(json!({ "admins": admins, "pending": pending }))).into_response()
+}
+
+#[derive(Deserialize)]
+struct DeviceIdBody {
+    #[serde(rename = "deviceId")]
+    device_id: String,
+}
+
+/// `POST /admin/devices/approve` — ADMIN ONLY. Promote a pending device to admin.
+async fn admin_devices_approve(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DeviceIdBody>,
+) -> impl IntoResponse {
+    if let Err(resp) = require_admin(&st, &headers) {
+        return resp;
+    }
+    match st.admins.approve(&body.device_id) {
+        Ok(true) => (StatusCode::OK, Json(json!({"ok": true, "role": "admin"}))).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no pending device with that id"})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "approve persist failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "store"}))).into_response()
+        }
+    }
+}
+
+/// `POST /admin/devices/revoke` — ADMIN ONLY. Remove a device. Cannot remove the last admin.
+async fn admin_devices_revoke(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DeviceIdBody>,
+) -> impl IntoResponse {
+    if let Err(resp) = require_admin(&st, &headers) {
+        return resp;
+    }
+    match st.admins.revoke(&body.device_id) {
+        Ok(RevokeOutcome::Removed) => {
+            (StatusCode::OK, Json(json!({"ok": true}))).into_response()
+        }
+        Ok(RevokeOutcome::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "no device with that id"})),
+        )
+            .into_response(),
+        Ok(RevokeOutcome::LastAdmin) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "cannot revoke the last admin"})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "revoke persist failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "store"}))).into_response()
         }
     }
 }
@@ -313,21 +522,46 @@ mod tests {
         DeviceKey::from_json(dk_json).unwrap()
     }
 
-    /// State with the test device enrolled and a fixed server secret (so challenges are reproducible
-    /// across handler calls within a test).
+    /// A SECOND, distinct real P-256 device key (different ecdsa keypair + id) used to exercise the
+    /// request/approve/revoke flow against the seeded admin. The ecdh half mirrors the ecdsa pub
+    /// (irrelevant to signing); the id is fixed and distinct from `test_device()`.
+    fn second_device() -> DeviceKey {
+        let dk_json = r#"{
+          "ecdhPriv":{"key_ops":["deriveBits"],"ext":true,"kty":"EC","x":"Xmkz8xdxZN39CEu4t437RTP9zqSpeN_HEPWFl-Wcvic","y":"WHvWLOzDWyZmUhG8nnISc8dN5Gol-Cyfm1YaJpIvUWU","crv":"P-256","d":"ok8M6GVgJIfF71fjBubSB3L_0HvfvcQeunr9N-5IFnA"},
+          "ecdhPub":{"key_ops":[],"ext":true,"kty":"EC","x":"Xmkz8xdxZN39CEu4t437RTP9zqSpeN_HEPWFl-Wcvic","y":"WHvWLOzDWyZmUhG8nnISc8dN5Gol-Cyfm1YaJpIvUWU","crv":"P-256"},
+          "ecdsaPriv":{"key_ops":["sign"],"ext":true,"kty":"EC","x":"Xmkz8xdxZN39CEu4t437RTP9zqSpeN_HEPWFl-Wcvic","y":"WHvWLOzDWyZmUhG8nnISc8dN5Gol-Cyfm1YaJpIvUWU","crv":"P-256","d":"ok8M6GVgJIfF71fjBubSB3L_0HvfvcQeunr9N-5IFnA"},
+          "ecdsaPub":{"key_ops":["verify"],"ext":true,"kty":"EC","x":"Xmkz8xdxZN39CEu4t437RTP9zqSpeN_HEPWFl-Wcvic","y":"WHvWLOzDWyZmUhG8nnISc8dN5Gol-Cyfm1YaJpIvUWU","crv":"P-256"},
+          "id":"f00dcafe12345678"
+        }"#;
+        DeviceKey::from_json(dk_json).unwrap()
+    }
+
+    /// The compact ECDSA SEC1 pub for a device — the exact string the console derives and persists.
+    fn compact_pub(dk: &DeviceKey) -> String {
+        ce_secrets_rs::encoding::b64url_encode(&dk.ecdsa_pub.raw_public_bytes().unwrap())
+    }
+
+    /// State with the test device SEEDED as an admin (mirrors `CE_WATCH_ADMIN_DEVICES`) and a fixed
+    /// server secret (so challenges are reproducible across handler calls within a test).
     fn state_with(dir: std::path::PathBuf) -> AppState {
         let dk = test_device();
-        let mut devices = Devices::default();
-        devices
-            .insert_compact(
-                &dk.id,
-                &ce_secrets_rs::encoding::b64url_encode(&dk.ecdsa_pub.raw_public_bytes().unwrap()),
-            )
-            .unwrap();
+        let seed = vec![(dk.id.clone(), compact_pub(&dk))];
+        let admins = Arc::new(AdminStore::open(&dir, &seed).expect("open admin store"));
         AppState {
             store: Arc::new(Store::open(dir).expect("open store")),
             ingest_token: Arc::new(Some("ingest-secret".to_string())),
-            devices: Arc::new(devices),
+            admins,
+            server_secret: Arc::new(SERVER_SECRET.to_vec()),
+        }
+    }
+
+    /// State with NO admins seeded — empty store (used to test claim/request/unauthorized paths).
+    fn state_empty(dir: std::path::PathBuf) -> AppState {
+        let admins = Arc::new(AdminStore::open(&dir, &[]).expect("open admin store"));
+        AppState {
+            store: Arc::new(Store::open(dir).expect("open store")),
+            ingest_token: Arc::new(Some("ingest-secret".to_string())),
+            admins,
             server_secret: Arc::new(SERVER_SECRET.to_vec()),
         }
     }
@@ -459,15 +693,11 @@ mod tests {
 
     #[tokio::test]
     async fn admin_rejects_unenrolled_device() {
-        // A device that is NOT in CE_WATCH_ADMIN_DEVICES — empty registry — is rejected even with a
-        // perfectly valid signature over a live challenge.
+        // A device that is NOT an admin — empty store, nobody claimed — is rejected from /admin/flags
+        // even with a perfectly valid signature over a live challenge (key-valid != is-admin). It has
+        // no persisted pub, so even key-resolution falls through to 401 here.
         let dir = temp_dir();
-        let st = AppState {
-            store: Arc::new(Store::open(dir.clone()).unwrap()),
-            ingest_token: Arc::new(Some("ingest-secret".into())),
-            devices: Arc::new(Devices::default()), // nobody enrolled
-            server_secret: Arc::new(SERVER_SECRET.to_vec()),
-        };
+        let st = state_empty(dir.clone());
         let app = router(st);
         let dk = test_device();
         let headers = signed_admin_headers(&app, &dk).await;
@@ -540,6 +770,212 @@ mod tests {
         assert_eq!(flags.len(), 5);
         // Newest-first ordering preserved across restart.
         assert!(flags[0].seq > flags[1].seq);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- self-service admin enrollment ----
+
+    /// Sign a live challenge and return the admin headers, exactly as a real device would.
+    async fn signed_headers(app: &Router, dk: &DeviceKey) -> Vec<(String, String)> {
+        signed_admin_headers(app, dk).await
+    }
+
+    #[tokio::test]
+    async fn first_claim_makes_admin_second_claim_conflicts() {
+        let dir = temp_dir();
+        let st = state_empty(dir.clone());
+        let app = router(st.clone());
+        let dk = test_device();
+        let pub_b64 = compact_pub(&dk);
+
+        // First claim on an empty store -> 200, device becomes admin.
+        let headers = signed_headers(&app, &dk).await;
+        let body = json!({ "pub": pub_b64 }).to_string();
+        let req = with_headers(
+            Request::builder().method("POST").uri("/admin/claim").header("content-type", "application/json"),
+            &headers,
+        )
+        .body(Body::from(body.clone()))
+        .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(st.admins.is_admin(&dk.id));
+
+        // Second claim (store now has an admin) -> 409.
+        let headers = signed_headers(&app, &dk).await;
+        let req = with_headers(
+            Request::builder().method("POST").uri("/admin/claim").header("content-type", "application/json"),
+            &headers,
+        )
+        .body(Body::from(body))
+        .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn request_then_approve_grants_flags_access_and_revoke_removes_it() {
+        // Admin (seeded) device.
+        let dir = temp_dir();
+        let st = state_with(dir.clone());
+        let app = router(st.clone());
+        let admin = test_device();
+
+        // A second, distinct device requests access.
+        let requester = second_device();
+        let req_pub = compact_pub(&requester);
+
+        // Before approval: key-valid but NOT admin -> /admin/flags is 401.
+        let headers = signed_headers(&app, &requester).await;
+        // requester is unknown to the store; flags needs role=admin -> rejected.
+        let req = with_headers(Request::builder().uri("/admin/flags"), &headers)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // It can /admin/request (recorded as pending, with its pub).
+        let headers = signed_headers(&app, &requester).await;
+        let body = json!({ "label": "leif-phone", "pub": req_pub }).to_string();
+        let req = with_headers(
+            Request::builder().method("POST").uri("/admin/request").header("content-type", "application/json"),
+            &headers,
+        )
+        .body(Body::from(body))
+        .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(st.admins.role_of(&requester.id), "pending");
+
+        // The admin lists devices and sees the pending requester.
+        let headers = signed_headers(&app, &admin).await;
+        let req = with_headers(Request::builder().uri("/admin/devices"), &headers)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        assert_eq!(j["pending"].as_array().unwrap().len(), 1);
+
+        // The admin approves it.
+        let headers = signed_headers(&app, &admin).await;
+        let body = json!({ "deviceId": requester.id }).to_string();
+        let req = with_headers(
+            Request::builder().method("POST").uri("/admin/devices/approve").header("content-type", "application/json"),
+            &headers,
+        )
+        .body(Body::from(body))
+        .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(st.admins.is_admin(&requester.id));
+
+        // Now the requester CAN read /admin/flags (200).
+        let headers = signed_headers(&app, &requester).await;
+        let req = with_headers(Request::builder().uri("/admin/flags"), &headers)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The admin revokes the requester -> access removed.
+        let headers = signed_headers(&app, &admin).await;
+        let body = json!({ "deviceId": requester.id }).to_string();
+        let req = with_headers(
+            Request::builder().method("POST").uri("/admin/devices/revoke").header("content-type", "application/json"),
+            &headers,
+        )
+        .body(Body::from(body))
+        .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(st.admins.role_of(&requester.id), "none");
+
+        // Revoked device is back to 401 on flags.
+        let headers = signed_headers(&app, &requester).await;
+        let req = with_headers(Request::builder().uri("/admin/flags"), &headers)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cannot_revoke_last_admin() {
+        let dir = temp_dir();
+        let st = state_with(dir.clone()); // exactly one seeded admin
+        let app = router(st.clone());
+        let admin = test_device();
+
+        let headers = signed_headers(&app, &admin).await;
+        let body = json!({ "deviceId": admin.id }).to_string();
+        let req = with_headers(
+            Request::builder().method("POST").uri("/admin/devices/revoke").header("content-type", "application/json"),
+            &headers,
+        )
+        .body(Body::from(body))
+        .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(st.admins.is_admin(&admin.id)); // still there
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn env_seeded_admin_still_works() {
+        // A device seeded via the env (state_with mirrors CE_WATCH_ADMIN_DEVICES) is admin and can
+        // read /admin/flags immediately, with no claim step.
+        let dir = temp_dir();
+        let st = state_with(dir.clone());
+        let app = router(st);
+        let dk = test_device();
+        let headers = signed_headers(&app, &dk).await;
+        let req = with_headers(Request::builder().uri("/admin/flags"), &headers)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn admin_store_survives_reload() {
+        let dir = temp_dir();
+        let requester = second_device();
+        {
+            let st = state_with(dir.clone());
+            // Record the requester as pending, then approve it.
+            st.admins.request(&requester.id, &compact_pub(&requester), "x").unwrap();
+            assert!(st.admins.approve(&requester.id).unwrap());
+            assert!(st.admins.is_admin(&requester.id));
+        } // dropped — simulate restart
+
+        // Reopen with NO seed: the persisted file is the source of truth.
+        let admins = AdminStore::open(&dir, &[]).unwrap();
+        assert!(admins.is_admin(&requester.id));
+        assert!(admins.is_admin(&test_device().id)); // the seeded admin persisted too
+        assert_eq!(admins.admin_count(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn me_reports_role() {
+        let dir = temp_dir();
+        let st = state_with(dir.clone());
+        let app = router(st);
+        let dk = test_device();
+        let headers = signed_headers(&app, &dk).await;
+        let req = with_headers(Request::builder().uri("/admin/me"), &headers)
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let j = body_json(resp).await;
+        assert_eq!(j["role"], "admin");
+        assert_eq!(j["hasAdmins"], true);
+        assert_eq!(j["deviceId"], dk.id);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
