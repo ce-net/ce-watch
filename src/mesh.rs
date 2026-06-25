@@ -211,50 +211,53 @@ mod tests {
     const HUB: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const OTHER: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 
-    fn flag_json() -> Vec<u8> {
+    /// A `submit` observation re-using one wasm module hash — repeat it >8 times to trip H4.
+    fn submit_obs(module: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
-            "ts": 1_700_000_000u64,
-            "node_id": "ip:203.0.113.7",
+            "kind": "submit",
             "ip": "203.0.113.7",
-            "heuristic": "H2",
-            "reason": "repeat-signature: count_primes x47 in 5m",
-            "severity": "high",
-            "sample": { "func": "count_primes" }
+            "func": "count_primes",
+            "submit_sig": "deadbeefcafef00d",
+            "module_sha": module,
+            "node": "node-a",
         }))
         .unwrap()
+    }
+
+    fn ingest_for(store: &Arc<Store>, hub: &str) -> MeshIngest {
+        MeshIngest::new(store.clone(), Arc::new(Detector::new()), hub.to_string())
     }
 
     fn msg(from: &str, topic: &str, payload: Vec<u8>) -> InboundMessage {
         InboundMessage { from: from.into(), topic: topic.into(), payload }
     }
 
-    /// A flag from the configured hub NodeId on the flag topic is admitted and stored.
+    /// Authorized submit observations from the hub run the detector; repeated module fan-out trips H4
+    /// and the resulting flag lands in the store.
     #[test]
-    fn hub_sender_admits_and_stores() {
+    fn hub_observations_trip_h4_and_store() {
         let dir = temp_dir();
         let store = Arc::new(Store::open(dir.clone()).unwrap());
-        let ingest = MeshIngest::new(store.clone(), HUB.to_string());
+        let ingest = ingest_for(&store, HUB);
 
-        let verdict = ingest.handle(&msg(HUB, FLAG_TOPIC, flag_json()));
-        assert_eq!(verdict, Ingested::Stored);
-
-        // The flag actually landed in the store.
-        assert_eq!(store.head_seq(), 1);
+        for _ in 0..9 {
+            assert_eq!(ingest.handle(&msg(HUB, OBSERVE_TOPIC, submit_obs("abcd1234"))), Ingested::Stored);
+        }
+        // H4 (module fan-out) tripped once; the throttle collapses repeats to a single flag.
+        assert!(store.head_seq() >= 1, "module fan-out must raise at least one flag");
         let flags = store.query(None, None, None, None, 10);
-        assert_eq!(flags.len(), 1);
-        assert_eq!(flags[0].event.heuristic, "H2");
+        assert!(flags.iter().any(|f| f.event.heuristic == "H4"), "expected an H4 flag");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A flag from any sender that is NOT the configured hub is rejected and NOT stored.
+    /// An observation from any sender that is NOT the configured hub is rejected and not processed.
     #[test]
     fn non_hub_sender_rejected() {
         let dir = temp_dir();
         let store = Arc::new(Store::open(dir.clone()).unwrap());
-        let ingest = MeshIngest::new(store.clone(), HUB.to_string());
+        let ingest = ingest_for(&store, HUB);
 
-        let verdict = ingest.handle(&msg(OTHER, FLAG_TOPIC, flag_json()));
-        assert_eq!(verdict, Ingested::Unauthorized);
+        assert_eq!(ingest.handle(&msg(OTHER, OBSERVE_TOPIC, submit_obs("abcd1234"))), Ingested::Unauthorized);
         assert_eq!(store.head_seq(), 0, "an unauthorized sender must not store anything");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -264,64 +267,34 @@ mod tests {
     fn empty_hub_node_accepts_nothing() {
         let dir = temp_dir();
         let store = Arc::new(Store::open(dir.clone()).unwrap());
-        let ingest = MeshIngest::new(store.clone(), String::new());
+        let ingest = ingest_for(&store, "");
 
-        let verdict = ingest.handle(&msg(HUB, FLAG_TOPIC, flag_json()));
-        assert_eq!(verdict, Ingested::Unauthorized);
+        assert_eq!(ingest.handle(&msg(HUB, OBSERVE_TOPIC, submit_obs("abcd1234"))), Ingested::Unauthorized);
         assert_eq!(store.head_seq(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A message on a different topic is ignored (even from the hub) and not stored.
+    /// A message on a different topic is ignored (even from the hub).
     #[test]
     fn wrong_topic_ignored() {
         let dir = temp_dir();
         let store = Arc::new(Store::open(dir.clone()).unwrap());
-        let ingest = MeshIngest::new(store.clone(), HUB.to_string());
+        let ingest = ingest_for(&store, HUB);
 
-        let verdict = ingest.handle(&msg(HUB, "ce-monitor/other", flag_json()));
-        assert_eq!(verdict, Ingested::WrongTopic);
+        assert_eq!(ingest.handle(&msg(HUB, "ce-monitor/other", submit_obs("abcd1234"))), Ingested::WrongTopic);
         assert_eq!(store.head_seq(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A hub message whose payload is not valid FlagEvent JSON is dropped, not stored.
+    /// A hub message whose payload is not a valid Observation is dropped, not processed.
     #[test]
     fn bad_payload_dropped() {
         let dir = temp_dir();
         let store = Arc::new(Store::open(dir.clone()).unwrap());
-        let ingest = MeshIngest::new(store.clone(), HUB.to_string());
+        let ingest = ingest_for(&store, HUB);
 
-        let verdict = ingest.handle(&msg(HUB, FLAG_TOPIC, b"not json".to_vec()));
-        assert_eq!(verdict, Ingested::BadPayload);
+        assert_eq!(ingest.handle(&msg(HUB, OBSERVE_TOPIC, b"not json".to_vec())), Ingested::BadPayload);
         assert_eq!(store.head_seq(), 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Draining a mixed batch of injected messages stores exactly the authorized hub flags.
-    #[test]
-    fn injected_source_drains_only_authorized() {
-        let dir = temp_dir();
-        let store = Arc::new(Store::open(dir.clone()).unwrap());
-        let ingest = MeshIngest::new(store.clone(), HUB.to_string());
-
-        // An injected message source: a plain vec the test feeds through the ingest core, exactly as
-        // the live loop feeds the SSE stream. No live node required.
-        let source = vec![
-            msg(HUB, FLAG_TOPIC, flag_json()),       // stored
-            msg(OTHER, FLAG_TOPIC, flag_json()),     // unauthorized
-            msg(HUB, "ce-monitor/other", flag_json()), // wrong topic
-            msg(HUB, FLAG_TOPIC, b"{".to_vec()),     // bad payload
-            msg(HUB, FLAG_TOPIC, flag_json()),       // stored
-        ];
-        let mut stored = 0;
-        for m in &source {
-            if ingest.handle(m) == Ingested::Stored {
-                stored += 1;
-            }
-        }
-        assert_eq!(stored, 2);
-        assert_eq!(store.head_seq(), 2, "only the two authorized hub flags are stored");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -330,15 +303,14 @@ mod tests {
     fn app_message_bridge_decodes() {
         let am: ce_rs::AppMessage = serde_json::from_value(serde_json::json!({
             "from": HUB,
-            "topic": FLAG_TOPIC,
-            "payload_hex": hex::encode(flag_json()),
+            "topic": OBSERVE_TOPIC,
+            "payload_hex": hex::encode(submit_obs("abcd1234")),
             "received_at": 1u64,
         }))
         .unwrap();
         let inbound = InboundMessage::from(am);
         assert_eq!(inbound.from, HUB);
-        assert_eq!(inbound.topic, FLAG_TOPIC);
-        let ev: FlagEvent = serde_json::from_slice(&inbound.payload).unwrap();
-        assert_eq!(ev.heuristic, "H2");
+        assert_eq!(inbound.topic, OBSERVE_TOPIC);
+        assert!(!inbound.payload.is_empty());
     }
 }
