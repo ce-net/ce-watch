@@ -1,13 +1,13 @@
 //! Mesh flag ingest — the real CE mesh receiver that replaces the old `POST /ingest` HTTP cheat.
 //!
-//! ce-watch attaches to its co-located `ce` node over `ce-rs` (`CeClient` at `CE_NODE_URL`, default
+//! ce-monitor attaches to its co-located `ce` node over `ce-rs` (`CeClient` at `CE_NODE_URL`, default
 //! `http://127.0.0.1:8844`) and drains the node's inbound app-message stream
 //! (`CeClient::messages_stream` -> `GET /mesh/messages/stream`). Each incoming [`ce_rs::AppMessage`]
 //! arrives tagged with a **Noise-authenticated sender NodeId** (`msg.from`), which the local node
-//! verified — that replaces the deleted `x-ce-watch-token` shared secret entirely.
+//! verified — that replaces the deleted `x-ce-monitor-token` shared secret entirely.
 //!
-//! Authorization is **by sender**: we accept a flag only when `msg.from == CE_WATCH_HUB_NODE` (the
-//! hub's NodeId) and `msg.topic == "ce-watch/flag"`. Anything else — wrong sender, wrong topic, or
+//! Authorization is **by sender**: we accept a flag only when `msg.from == CE_MONITOR_HUB_NODE` (the
+//! hub's NodeId) and `msg.topic == "ce-monitor/flag"`. Anything else — wrong sender, wrong topic, or
 //! an undeserializable payload — is dropped. Admitted flags go straight to the existing [`Store`].
 //!
 //! The receive/authorize/store core ([`MeshIngest::handle`]) is split from the transport so it can
@@ -20,7 +20,7 @@ use std::time::Duration;
 use crate::store::{FlagEvent, Store};
 
 /// The topic every flag is published on. The hub sends with this exact topic; we filter on it.
-pub const FLAG_TOPIC: &str = "ce-watch/flag";
+pub const FLAG_TOPIC: &str = "ce-monitor/flag";
 
 /// Default ce node API base URL when `CE_NODE_URL` is unset — the co-located local node.
 pub const DEFAULT_CE_NODE_URL: &str = "http://127.0.0.1:8844";
@@ -86,24 +86,24 @@ impl MeshIngest {
         if self.hub_node.is_empty() || msg.from != self.hub_node {
             tracing::warn!(
                 from = %msg.from,
-                "ce-watch: dropping flag from unauthorized sender (not the configured hub node)"
+                "ce-monitor: dropping flag from unauthorized sender (not the configured hub node)"
             );
             return Ingested::Unauthorized;
         }
         let event: FlagEvent = match serde_json::from_slice(&msg.payload) {
             Ok(ev) => ev,
             Err(e) => {
-                tracing::warn!(error = %e, "ce-watch: dropping flag with undeserializable payload");
+                tracing::warn!(error = %e, "ce-monitor: dropping flag with undeserializable payload");
                 return Ingested::BadPayload;
             }
         };
         match self.store.append(event) {
             Ok(seq) => {
-                tracing::info!(seq, from = %msg.from, "ce-watch: stored mesh flag");
+                tracing::info!(seq, from = %msg.from, "ce-monitor: stored mesh flag");
                 Ingested::Stored
             }
             Err(e) => {
-                tracing::error!(error = %e, "ce-watch: store append failed for mesh flag");
+                tracing::error!(error = %e, "ce-monitor: store append failed for mesh flag");
                 // Append failure is a storage fault, not a policy outcome; surface as BadPayload so
                 // the caller does not treat it as stored. (The flag is lost; logged loudly above.)
                 Ingested::BadPayload
@@ -120,9 +120,9 @@ pub fn ce_node_url() -> String {
         .unwrap_or_else(|| DEFAULT_CE_NODE_URL.to_string())
 }
 
-/// Resolve the hub's authorized NodeId from `CE_WATCH_HUB_NODE`. Empty (unset) => accept no flags.
+/// Resolve the hub's authorized NodeId from `CE_MONITOR_HUB_NODE`. Empty (unset) => accept no flags.
 pub fn hub_node() -> String {
-    std::env::var("CE_WATCH_HUB_NODE").unwrap_or_default()
+    std::env::var("CE_MONITOR_HUB_NODE").unwrap_or_default()
 }
 
 /// Run the live mesh receiver forever: open the node's app-message SSE stream and feed every message
@@ -138,7 +138,7 @@ pub async fn run(ce: ce_rs::CeClient, ingest: Arc<MeshIngest>) {
     loop {
         match ce.messages_stream().await {
             Ok(stream) => {
-                tracing::info!(node_url = %ce.base_url(), topic = FLAG_TOPIC, "ce-watch mesh inbox up");
+                tracing::info!(node_url = %ce.base_url(), topic = FLAG_TOPIC, "ce-monitor mesh inbox up");
                 backoff = Duration::from_millis(500);
                 let mut stream = std::pin::pin!(stream);
                 while let Some(item) = stream.next().await {
@@ -147,7 +147,7 @@ pub async fn run(ce: ce_rs::CeClient, ingest: Arc<MeshIngest>) {
                             let _ = ingest.handle(&InboundMessage::from(m));
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, "ce-watch mesh stream error; reconnecting");
+                            tracing::warn!(error = %e, "ce-monitor mesh stream error; reconnecting");
                             break;
                         }
                     }
@@ -157,7 +157,7 @@ pub async fn run(ce: ce_rs::CeClient, ingest: Arc<MeshIngest>) {
                 tracing::warn!(
                     error = %e,
                     node_url = %ce.base_url(),
-                    "ce-watch: local ce node unreachable; retrying mesh inbox"
+                    "ce-monitor: local ce node unreachable; retrying mesh inbox"
                 );
             }
         }
@@ -176,7 +176,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        d.push(format!("ce-watch-mesh-test-{}-{}", std::process::id(), nanos));
+        d.push(format!("ce-monitor-mesh-test-{}-{}", std::process::id(), nanos));
         d
     }
 
@@ -251,7 +251,7 @@ mod tests {
         let store = Arc::new(Store::open(dir.clone()).unwrap());
         let ingest = MeshIngest::new(store.clone(), HUB.to_string());
 
-        let verdict = ingest.handle(&msg(HUB, "ce-watch/other", flag_json()));
+        let verdict = ingest.handle(&msg(HUB, "ce-monitor/other", flag_json()));
         assert_eq!(verdict, Ingested::WrongTopic);
         assert_eq!(store.head_seq(), 0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -282,7 +282,7 @@ mod tests {
         let source = vec![
             msg(HUB, FLAG_TOPIC, flag_json()),       // stored
             msg(OTHER, FLAG_TOPIC, flag_json()),     // unauthorized
-            msg(HUB, "ce-watch/other", flag_json()), // wrong topic
+            msg(HUB, "ce-monitor/other", flag_json()), // wrong topic
             msg(HUB, FLAG_TOPIC, b"{".to_vec()),     // bad payload
             msg(HUB, FLAG_TOPIC, flag_json()),       // stored
         ];

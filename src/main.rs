@@ -1,25 +1,25 @@
-//! ce-watch — the operator's security console for CE.
+//! ce-monitor — the operator's security console for CE.
 //!
 //! A light axum service that lives beside the relay. It does two things:
 //!
 //!   1. Receives flag events from the hub's abuse detector **over the CE mesh** (a directed
-//!      `send_message` on topic `ce-watch/flag`, authenticated by the libp2p sender NodeId) and
+//!      `send_message` on topic `ce-monitor/flag`, authenticated by the libp2p sender NodeId) and
 //!      appends them to a durable, bounded, append-only log. There is NO HTTP and NO shared token
-//!      between the hub and ce-watch — see [`mesh`]. (The old `POST /ingest` + `x-ce-watch-token`
+//!      between the hub and ce-monitor — see [`mesh`]. (The old `POST /ingest` + `x-ce-monitor-token`
 //!      cheat is gone.)
 //!   2. Serves an admin-only single-page "security console" that renders the flag log as a
 //!      structured, filterable table with an unseen-count indicator.
 //!
-//! ce-watch holds NO device registry and NO in-process crypto. It is a thin **relying party** of
+//! ce-monitor holds NO device registry and NO in-process crypto. It is a thin **relying party** of
 //! **ce-auth**, reached over the CE MESH (not HTTP): every admin request carries the operator's
-//! device-signed headers, which ce-watch forwards to ce-auth's `verify` verb (located via
+//! device-signed headers, which ce-monitor forwards to ce-auth's `verify` verb (located via
 //! [`ce_rs::locate`], sent via [`ce_rs::CeClient::request`] on topic `ce-auth/rpc`); it admits iff
 //! `{ok:true}`. Device enrollment, claim, request, approve and revoke all live in ce-auth. If no live
-//! ce-auth instance can be reached, ce-watch fails CLOSED (503).
+//! ce-auth instance can be reached, ce-monitor fails CLOSED (503).
 //!
 //! `GET /admin/challenge` runs ce-auth's `challenge` verb over the mesh and relays the
 //! `{ aud, nonce, ts }` so the browser console never needs to know how to reach ce-auth. That HTTP
-//! edge is the only HTTP in ce-watch's auth path, and it terminates at this process; the hop to
+//! edge is the only HTTP in ce-monitor's auth path, and it terminates at this process; the hop to
 //! ce-auth is pure mesh.
 
 mod auth;
@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ce_watch=info,tower_http=warn".into()),
+                .unwrap_or_else(|_| "ce_monitor=info,tower_http=warn".into()),
         )
         .init();
 
@@ -74,14 +74,14 @@ async fn main() -> Result<()> {
     let verifier: Arc<dyn DynVerifier> = Arc::new(MeshVerifier::new(ce.clone()));
 
     // Flag ingest is a MESH receiver: drain the node's app-message stream, admitting only flags from
-    // the hub's NodeId on topic `ce-watch/flag`. No HTTP, no token.
+    // the hub's NodeId on topic `ce-monitor/flag`. No HTTP, no token.
     let hub_node = mesh::hub_node();
     if hub_node.is_empty() {
         tracing::warn!(
-            "CE_WATCH_HUB_NODE is unset — every mesh flag will be rejected (no authorized hub)"
+            "CE_MONITOR_HUB_NODE is unset — every mesh flag will be rejected (no authorized hub)"
         );
     } else {
-        tracing::info!(hub_node = %hub_node, node_url = %node_url, "ce-watch mesh flag ingest armed");
+        tracing::info!(hub_node = %hub_node, node_url = %node_url, "ce-monitor mesh flag ingest armed");
     }
     let ingest = Arc::new(MeshIngest::new(store.clone(), hub_node));
     tokio::spawn(mesh::run(ce.clone(), ingest));
@@ -95,7 +95,7 @@ async fn main() -> Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8971);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    tracing::info!(%addr, data_dir = %data_dir.display(), "ce-watch listening");
+    tracing::info!(%addr, data_dir = %data_dir.display(), "ce-monitor listening");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)
@@ -117,11 +117,11 @@ fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// `GET /admin/challenge` — run ce-auth's `challenge` verb for `aud=ce-watch` over the mesh and relay
+/// `GET /admin/challenge` — run ce-auth's `challenge` verb for `aud=ce-monitor` over the mesh and relay
 /// the `{ aud, nonce, ts }` to the browser console. The console signs it with its device key; only a
 /// device enrolled in ce-auth can produce a signature that ce-auth's `verify` will later accept, so
 /// handing out challenges is harmless. If no live ce-auth instance can be reached we fail closed
-/// (503). This is the one HTTP edge (console -> ce-watch); the hop to ce-auth is pure mesh.
+/// (503). This is the one HTTP edge (console -> ce-monitor); the hop to ce-auth is pure mesh.
 async fn admin_challenge(State(st): State<AppState>) -> impl IntoResponse {
     match st.verifier.challenge_dyn().await {
         Ok(ch) => (StatusCode::OK, Json(ch)).into_response(),
@@ -256,7 +256,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        d.push(format!("ce-watch-test-{}-{}", std::process::id(), nanos));
+        d.push(format!("ce-monitor-test-{}-{}", std::process::id(), nanos));
         d
     }
 
@@ -327,7 +327,7 @@ mod tests {
         vec![
             ("x-ce-device-id".into(), "dev-abc".into()),
             ("x-ce-auth".into(), "sig-xyz".into()),
-            ("x-ce-aud".into(), "ce-watch".into()),
+            ("x-ce-aud".into(), "ce-monitor".into()),
             ("x-ce-nonce".into(), "nonce-1".into()),
             ("x-ce-ts".into(), "2026-06-24T00:00:00.000Z".into()),
         ]
@@ -439,7 +439,7 @@ mod tests {
         let seen = mock.seen.lock().unwrap().clone().expect("verifier was called");
         assert_eq!(seen.device_id, "dev-abc");
         assert_eq!(seen.sig, "sig-xyz");
-        assert_eq!(seen.aud, "ce-watch");
+        assert_eq!(seen.aud, "ce-monitor");
         assert_eq!(seen.nonce, "nonce-1");
         assert_eq!(seen.ts, "2026-06-24T00:00:00.000Z");
         let _ = std::fs::remove_dir_all(&dir);
@@ -508,7 +508,7 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let j = body_json(resp).await;
-        assert_eq!(j["aud"], "ce-watch");
+        assert_eq!(j["aud"], "ce-monitor");
         assert_eq!(j["nonce"], "abcd1234");
         assert_eq!(j["ts"], "2026-06-24T00:00:00.000Z");
         let _ = std::fs::remove_dir_all(&dir);

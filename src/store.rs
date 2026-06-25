@@ -220,12 +220,12 @@ fn rotate(g: &mut Inner) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the data dir from env (`CE_WATCH_DATA_DIR`) or default to `./ce-watch-data`.
+/// Resolve the data dir from env (`CE_MONITOR_DATA_DIR`) or default to `./ce-monitor-data`.
 pub fn default_data_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("CE_WATCH_DATA_DIR") {
+    if let Ok(d) = std::env::var("CE_MONITOR_DATA_DIR") {
         if !d.is_empty() {
             return PathBuf::from(d);
         }
     }
-    Path::new("ce-watch-data").to_path_buf()
+    Path::new("ce-monitor-data").to_path_buf()
 }

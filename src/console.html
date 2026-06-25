@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="robots" content="noindex,nofollow" />
-<title>ce-watch // security console</title>
+<title>ce-monitor // security console</title>
 <style>
   :root {
     --bg: #07090d;
@@ -135,14 +135,14 @@
 <body>
 <div id="app"></div>
 <script>
-// ce-watch admin auth — ce-auth challenge-response, inlined WebCrypto (byte-exact with the canonical
-// crypto.mjs / auth.mjs and the Rust SDK). The operator's device key lives in localStorage. ce-watch
+// ce-monitor admin auth — ce-auth challenge-response, inlined WebCrypto (byte-exact with the canonical
+// crypto.mjs / auth.mjs and the Rust SDK). The operator's device key lives in localStorage. ce-monitor
 // is a RELYING PARTY: device enrollment, claim, request, approve and revoke all live in ce-auth
 // (auth.ce-net.com). This console only signs a challenge and presents the device-signed headers; if
 // this device isn't an enrolled admin, ce-auth denies it and we show a "manage at ce-auth" screen.
-const LS_DEVICE = "ce-watch-device-key";
-const AUD = "ce-watch";
-// Where the operator manages their devices. ce-watch no longer has any device-management UI.
+const LS_DEVICE = "ce-monitor-device-key";
+const AUD = "ce-monitor";
+// Where the operator manages their devices. ce-monitor no longer has any device-management UI.
 const CE_AUTH_CONSOLE = "https://auth.ce-net.com";
 const subtle = globalThis.crypto.subtle;
 let device = null;   // { ecdhPriv, ecdhPub, ecdsaPriv, ecdsaPub, id }
@@ -211,7 +211,7 @@ function h(tag, attrs, kids) {
   return e;
 }
 
-// The "this device isn't authorized" screen. ce-watch holds no device registry — enrollment and
+// The "this device isn't authorized" screen. ce-monitor holds no device registry — enrollment and
 // approval happen in ce-auth. We show the device id (so the operator can enroll it there) and a link
 // to the ce-auth console. No claim / request / approve UI lives here anymore.
 function unauthorizedScreen(msg) {
@@ -219,7 +219,7 @@ function unauthorizedScreen(msg) {
   app.innerHTML = "";
   const id = device ? device.id : "(generating…)";
   app.append(h("div", { class: "gate" }, [
-    h("h1", {}, ["ce-watch // not authorized"]),
+    h("h1", {}, ["ce-monitor // not authorized"]),
     h("p", {}, [
       "This device isn't authorized. Manage your devices at ",
       h("a", { href: CE_AUTH_CONSOLE, target: "_blank", rel: "noreferrer" }, ["auth.ce-net.com"]),
@@ -234,13 +234,13 @@ function unauthorizedScreen(msg) {
   ]));
 }
 
-// The "auth service unavailable" screen — ce-auth is unreachable, so ce-watch fails closed. The
+// The "auth service unavailable" screen — ce-auth is unreachable, so ce-monitor fails closed. The
 // operator just retries once ce-auth is back.
 function authDownScreen() {
   const app = document.getElementById("app");
   app.innerHTML = "";
   app.append(h("div", { class: "gate" }, [
-    h("h1", {}, ["ce-watch // auth unavailable"]),
+    h("h1", {}, ["ce-monitor // auth unavailable"]),
     h("p", {}, [
       "The auth service (ce-auth) is unreachable, so this console can't verify your device right ",
       "now. This is fail-closed by design. Try again once ce-auth is back.",
@@ -415,7 +415,7 @@ function stopTimer() {
 
 async function boot() {
   if (!device) device = await loadOrCreateDevice();
-  // ce-watch is a relying party: there's no /admin/me and no local role. Just try /admin/flags with
+  // ce-monitor is a relying party: there's no /admin/me and no local role. Just try /admin/flags with
   // a freshly signed challenge. ce-auth decides: 200 admits, 401/403 -> not authorized (manage in
   // ce-auth), 503 -> auth service down (fail-closed).
   stopTimer();

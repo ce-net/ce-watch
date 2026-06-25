@@ -1,9 +1,9 @@
-//! ce-watch as a thin RELYING PARTY of ce-auth — over the CE MESH, not HTTP.
+//! ce-monitor as a thin RELYING PARTY of ce-auth — over the CE MESH, not HTTP.
 //!
-//! ce-watch no longer manages devices, holds no admin store, and runs no in-process crypto. It
+//! ce-monitor no longer manages devices, holds no admin store, and runs no in-process crypto. It
 //! delegates every admin decision to **ce-auth** (the operator's SSO surface), reached as a
 //! mesh-native service: ce-auth advertises the pinned name `ce-auth` and answers verbs on the topic
-//! `ce-auth/rpc` over libp2p ([`ce_rs::serve`]). ce-watch [`ce_rs::locate`]s a live instance and
+//! `ce-auth/rpc` over libp2p ([`ce_rs::serve`]). ce-monitor [`ce_rs::locate`]s a live instance and
 //! sends it requests via [`ce_rs::CeClient::request`]. There is NO HTTP hop to ce-auth and no shared
 //! secret. The contract every relying party uses:
 //!
@@ -12,7 +12,7 @@
 //!   - verb `verify` `{ aud, deviceId, sig, nonce, ts }` -> `{ ok, role, deviceId, .. }`. We forward
 //!     the device-signed values off an incoming admin request and admit iff `ok == true`.
 //!
-//! A device enrolled in ce-auth == the operator == trusted by ce-watch. Device enrollment, claim,
+//! A device enrolled in ce-auth == the operator == trusted by ce-monitor. Device enrollment, claim,
 //! request, approve and revoke all live in ce-auth now; this file holds only the relying-party glue.
 //!
 //! The [`Verifier`] trait abstracts the mesh round-trips to ce-auth so handlers (and tests) can
@@ -24,9 +24,9 @@ use axum::http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-/// The audience ce-watch binds challenges to. ce-auth derives + TTL-checks the stateless nonce
+/// The audience ce-monitor binds challenges to. ce-auth derives + TTL-checks the stateless nonce
 /// against this exact string, so a signature minted for a different `aud` will not verify.
-pub const AUD: &str = "ce-watch";
+pub const AUD: &str = "ce-monitor";
 
 /// The pinned mesh service name ce-auth advertises and relying parties `locate`. Mirrors
 /// `ce_auth::service::SERVICE_NAME`.
@@ -46,7 +46,7 @@ pub const MESH_TIMEOUT_MS: u64 = 5_000;
 pub struct SignedHeaders {
     pub device_id: String,
     pub sig: String,
-    /// The `x-ce-aud` the request claimed. Captured for logging/assertions; ce-watch always sends
+    /// The `x-ce-aud` the request claimed. Captured for logging/assertions; ce-monitor always sends
     /// its own pinned [`AUD`] to ce-auth's `verify`, so a token minted for a different app can never
     /// be replayed here even if the header claims otherwise.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -70,7 +70,7 @@ impl SignedHeaders {
     }
 }
 
-/// The body ce-watch sends to ce-auth's `verify` verb. `aud` is always pinned to ce-watch's own
+/// The body ce-monitor sends to ce-auth's `verify` verb. `aud` is always pinned to ce-monitor's own
 /// audience regardless of what the request claimed, so a device cannot get admitted here with a
 /// token minted for a different app.
 #[derive(Debug, Serialize)]
@@ -85,7 +85,7 @@ pub struct VerifyRequest<'a> {
 }
 
 /// ce-auth's `verify` reply. We admit iff `ok == true`; `role`/`deviceId` are surfaced for logs.
-/// ce-auth also returns `nodeId`/`cap`/`capRoot` on success, which ce-watch ignores (it only needs
+/// ce-auth also returns `nodeId`/`cap`/`capRoot` on success, which ce-monitor ignores (it only needs
 /// the boolean admit decision; the bridged cap is for apps that verify caps offline).
 #[derive(Debug, Clone, Deserialize)]
 pub struct VerifyResponse {
@@ -96,7 +96,7 @@ pub struct VerifyResponse {
     pub device_id: String,
 }
 
-/// A fresh challenge `{ aud, nonce, ts }` minted by ce-auth's `challenge` verb. ce-watch relays this
+/// A fresh challenge `{ aud, nonce, ts }` minted by ce-auth's `challenge` verb. ce-monitor relays this
 /// verbatim to the browser console, which signs it with its device key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Challenge {
@@ -281,14 +281,14 @@ mod tests {
         let h = headers(&[
             ("x-ce-device-id", "dev1"),
             ("x-ce-auth", "sigA"),
-            ("x-ce-aud", "ce-watch"),
+            ("x-ce-aud", "ce-monitor"),
             ("x-ce-nonce", "nnn"),
             ("x-ce-ts", "2026-06-24T00:00:00.000Z"),
         ]);
         let s = SignedHeaders::from_headers(&h).expect("all present");
         assert_eq!(s.device_id, "dev1");
         assert_eq!(s.sig, "sigA");
-        assert_eq!(s.aud, "ce-watch");
+        assert_eq!(s.aud, "ce-monitor");
         assert_eq!(s.nonce, "nnn");
     }
 
@@ -297,7 +297,7 @@ mod tests {
         let h = headers(&[
             ("x-ce-device-id", "dev1"),
             ("x-ce-auth", "sigA"),
-            ("x-ce-aud", "ce-watch"),
+            ("x-ce-aud", "ce-monitor"),
             ("x-ce-nonce", "nnn"),
             // x-ce-ts missing
         ]);
@@ -306,7 +306,7 @@ mod tests {
 
     #[test]
     fn verify_request_serializes_with_verb_and_pinned_aud() {
-        // The wire envelope must carry verb=verify and ce-watch's own AUD, never the request's claim.
+        // The wire envelope must carry verb=verify and ce-monitor's own AUD, never the request's claim.
         let body = VerifyRequest {
             verb: "verify",
             aud: AUD,
@@ -317,7 +317,7 @@ mod tests {
         };
         let v: Value = serde_json::to_value(&body).unwrap();
         assert_eq!(v["verb"], "verify");
-        assert_eq!(v["aud"], "ce-watch");
+        assert_eq!(v["aud"], "ce-monitor");
         assert_eq!(v["deviceId"], "dev1");
         assert_eq!(v["sig"], "sigA");
         assert_eq!(v["nonce"], "nnn");
