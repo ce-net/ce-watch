@@ -1,11 +1,11 @@
 [package]
-name = "ce-watch"
+name = "ce-monitor"
 version = "0.1.0"
 edition = "2024"
-description = "ce-watch — operator security console for CE: durable append-only flag log, token-gated ingest, and an admin-only dark dashboard. Light axum service beside the relay; a thin relying party of ce-auth for admin device-auth (no local device registry)."
+description = "ce-monitor — operator security console for CE: durable append-only flag log, token-gated ingest, and an admin-only dark dashboard. Light axum service beside the relay; a thin relying party of ce-auth for admin device-auth (no local device registry)."
 
 [[bin]]
-name = "ce-watch"
+name = "ce-monitor"
 path = "src/main.rs"
 
 [dependencies]
