@@ -1,0 +1,28 @@
+# ce-monitor — operator security console for CE. Installed + supervised by the one `ce` node via ce-appmgr.
+
+[app]
+name    = "ce-monitor"
+version = "0.1.0"
+summary = "Operator security console: durable mesh-ingested abuse-flag log + admin-only dashboard (relies on ce-auth)."
+runtime = "native"
+publisher = "c0be11e0ce0aaa769da6f9970244947d3d32a0c0d8302fb5f41f73d7950be456"
+provides = ["security-console"]
+
+[native]
+bin = "ce-monitor"
+[native.artifacts]
+"darwin-amd64" = "PLACEHOLDER_darwin_amd64"
+"linux-amd64"  = "PLACEHOLDER_linux_amd64"
+
+[deps]
+# Drains inbound mesh flag events + locates ce-auth via the local ce node (ce-rs locate).
+
+[sandbox]
+tier       = "none"
+net        = "none"
+capability = "inherit"
+
+[daemon]
+# Bare binary binds the admin console HTTP server + mesh flag ingest; no subcommand.
+enabled = true
+restart = "on-failure"
