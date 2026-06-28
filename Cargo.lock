@@ -145,6 +145,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "ce-monitor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "ce-rs",
+ "futures-util",
+ "hex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower 0.4.13",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ce-rs"
 version = "0.1.0"
 dependencies = [
@@ -160,24 +178,6 @@ dependencies = [
  "sha2",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "ce-watch"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "ce-rs",
- "futures-util",
- "hex",
- "serde",
- "serde_json",
- "tokio",
- "tower 0.4.13",
- "tower-http 0.5.2",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

@@ -23,7 +23,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # (locate::call on topic "ce-auth/rpc") for admin device-auth. ce-watch makes NO outbound HTTP: the
 # only HTTP edge is the browser console hitting ce-watch's own endpoints. reqwest is gone.
 # `locate` = mesh-native service discovery + selection (ce_rs::locate) used to find a live ce-auth.
-ce-rs = { path = "../ce-rs", features = ["locate"] }
+ce-rs = { git = "https://github.com/ce-net/ce-rs", features = ["locate"] }
 futures-util = "0.3"
 
 [dev-dependencies]
